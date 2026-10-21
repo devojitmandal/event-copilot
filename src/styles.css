@@ -1,0 +1,14 @@
+:root { font-family: system-ui, sans-serif; color: #1c1b22; background: #faf9fb; }
+main { max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+.sub { color: #5b5966; }
+.row { display: flex; gap: .5rem; margin: 1rem 0; }
+button { padding: .5rem 1rem; border: 1px solid #1c1b22; background: #fff; border-radius: 6px; text-transform: capitalize; cursor: pointer; }
+button[aria-pressed="true"] { background: #1c1b22; color: #fff; }
+button:focus-visible, input:focus-visible { outline: 3px solid #5b4bdb; outline-offset: 2px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+label { display: flex; flex-direction: column; gap: .25rem; font-size: .9rem; }
+input[type=number] { padding: .4rem; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: .5rem; border-bottom: 1px solid #dcdae2; }
+td:last-child, th:last-child { text-align: right; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
