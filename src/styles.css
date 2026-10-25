@@ -12,3 +12,20 @@ table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: .5rem; border-bottom: 1px solid #dcdae2; }
 td:last-child, th:last-child { text-align: right; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+small { display: block; color: #5b5966; font-size: .8rem; margin-top: .2rem; }
+button:disabled { opacity: .6; cursor: wait; }
+input[type=text], input:not([type]) { padding: .4rem; }
+.tasks { list-style: none; padding: 0; }
+.tasks li { display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding: .5rem 0; border-bottom: 1px solid #dcdae2; }
+.task { flex-direction: row; align-items: center; gap: .5rem; font-size: 1rem; }
+.chip { font-size: .8rem; padding: .15rem .5rem; border-radius: 999px; border: 1px solid #1c1b22; white-space: nowrap; }
+.chip.overdue { background: #b3261e; border-color: #b3261e; color: #fff; }
+.chip.due_soon { background: #ffe9a8; }
+.chip.done { background: #d8f0dc; text-decoration: line-through; }
+select { padding: .4rem; }
+td .chip { margin-left: .5rem; }
+.chip.good { background: #d8f0dc; }
+h3 small { display: inline; margin-left: .5rem; }
+.draft { border: 1px solid #dcdae2; border-radius: 8px; padding: 1rem; margin: 1rem 0; background: #fff; }
+textarea { padding: .4rem; font: inherit; }
+.upload > label { margin-bottom: .5rem; }

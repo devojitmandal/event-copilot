@@ -15,6 +15,13 @@ One shared planning engine, three event modes. Change the budget, guest count or
 - [ ] Risk checker
 - [ ] PDF export
 
+## Privacy and data handling
+- Uploaded quotations are sent to the Google Gemini API for extraction. The app does not store them.
+- Files are validated (type allowlist, 3 MB limit, file-signature check) before being sent.
+- Extracted details are only saved after the user reviews and confirms them.
+- Please don't upload documents containing personal details such as ID or bank numbers.
+- API keys stay on the server and are never sent to the browser.
+
 ## Run
 ```
 npm install
