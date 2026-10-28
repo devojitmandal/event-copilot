@@ -1,7 +1,7 @@
-import { applyBudgetCut, computeTotals, fitToBudget, itemCost } from "../lib/budget";
-import { buildPlan } from "../lib/templates";
-import type { CostItem, Cut, Totals } from "../lib/types";
-import { aiPlanSchema, sanitize, type AiPlan, type PlanRequest } from "./schema";
+import { applyBudgetCut, computeTotals, fitToBudget, itemCost } from "../lib/budget.js";
+import { buildPlan } from "../lib/templates.js";
+import type { CostItem, Cut, Totals } from "../lib/types.js";
+import { aiPlanSchema, sanitize, type AiPlan, type PlanRequest } from "./schema.js";
 
 export interface PlanResult {
   source: "ai" | "fallback";

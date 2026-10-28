@@ -104,8 +104,8 @@ export default function App() {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ mimeType: file.type, data, categories: view.plan.map((i) => ({ id: i.id, label: i.label })) }),
       });
-      const out = await res.json();
-      if (!res.ok) throw new Error(out.error ?? "Extraction failed.");
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out.error ?? "The server had a problem. Please try again.");
       const d = out.draft;
       const item = view.plan.find((i) => i.id === d.categoryId) ?? quoteItem;
       const norm = normaliseAmount(d.pricing, d.amount, item.basis, guests);
@@ -137,8 +137,8 @@ export default function App() {
     setLoading(true); setError("");
     try {
       const res = await fetch("/api/plan", { method: "POST", headers: { "Content-Type": "application/json" }, body: key });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Request failed");
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error ?? "The server had a problem. Please try again.");
       setAi({ key, result: data });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something went wrong. Try again.");

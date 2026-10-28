@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { sanitize } from "./schema";
+import { sanitize } from "./schema.js";
 
 export const MAX_FILE_BYTES = 3 * 1024 * 1024;
 export const MAX_EXTRACT_BODY = 4_200_000; // stays under Vercel's 4.5 MB request limit

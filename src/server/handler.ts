@@ -1,5 +1,5 @@
-import { generatePlan, type PlanResult } from "./plan";
-import { requestSchema } from "./schema";
+import { generatePlan, type PlanResult } from "./plan.js";
+import { requestSchema } from "./schema.js";
 
 export const MAX_BODY_BYTES = 4096;
 const RATE_LIMIT = 10;
