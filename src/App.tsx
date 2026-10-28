@@ -89,6 +89,9 @@ export default function App() {
 
   const draftItem = draft ? view.plan.find((i) => i.id === draft.itemId) ?? quoteItem : null;
   const upd = (k: keyof Draft, v: string) => setDraft((d) => (d ? { ...d, [k]: v } : d));
+  const draftPlanned = draftItem ? itemCost(draftItem, guests) : 0;
+  const draftTotal = draft && draftItem ? Math.round(Number(draft.amount || 0) * (draftItem.basis === "per_head" ? guests : 1)) : 0;
+  const draftSuspicious = draftTotal > available;
 
   async function onFile(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -176,7 +179,7 @@ export default function App() {
         </tbody>
         <tfoot>
           <tr><td colSpan={2}>Reserve</td><td>{inr(view.totals.reserve)}</td></tr>
-          <tr><td colSpan={2}>Total planned</td><td>{inr(view.totals.planned)}</td></tr>
+          <tr><td colSpan={2}>Total planned (excl. reserve)</td><td>{inr(view.totals.planned)}</td></tr>
         </tfoot>
       </table>
       {view.cuts.length > 0 && (
@@ -226,6 +229,8 @@ export default function App() {
                 <input type="number" min={1} value={draft.amount} onChange={(e) => upd("amount", e.target.value)} />
               </label>
             </div>
+            <p className="sub">Total for {guests} guests: <strong>{inr(draftTotal)}</strong> (plan: {inr(draftPlanned)}).</p>
+            {draftSuspicious && <p role="alert">This is more than your whole available budget. Check whether the amount is per guest or the total.</p>}
             <label>Includes (one per line)<textarea rows={3} value={draft.inclusions} onChange={(e) => upd("inclusions", e.target.value)} /></label>
             <label>Excludes (one per line)<textarea rows={3} value={draft.exclusions} onChange={(e) => upd("exclusions", e.target.value)} /></label>
             <label>Payment terms<input maxLength={300} value={draft.paymentTerms} onChange={(e) => upd("paymentTerms", e.target.value)} /></label>

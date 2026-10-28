@@ -29,3 +29,4 @@ h3 small { display: inline; margin-left: .5rem; }
 .draft { border: 1px solid #dcdae2; border-radius: 8px; padding: 1rem; margin: 1rem 0; background: #fff; }
 textarea { padding: .4rem; font: inherit; }
 .upload > label { margin-bottom: .5rem; }
+td:nth-child(2) { white-space: nowrap; }
