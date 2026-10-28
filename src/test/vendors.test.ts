@@ -1,5 +1,5 @@
-import { compareQuotes, makeQuote, projectedSpend, quoteTotal } from "../lib/vendors";
-import { buildPlan } from "../lib/templates";
+import { compareQuotes, makeQuote, projectedSpend, quoteTotal } from "../lib/vendors.js";
+import { buildPlan } from "../lib/templates.js";
 
 const items = buildPlan("wedding", 270000, 150);
 const venue = items.find((i) => i.id === "venue")!;

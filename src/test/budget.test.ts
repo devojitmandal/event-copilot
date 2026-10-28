@@ -1,5 +1,5 @@
-import { applyBudgetCut, computeTotals, fitToBudget, itemCost } from "../lib/budget";
-import { buildPlan } from "../lib/templates";
+import { applyBudgetCut, computeTotals, fitToBudget, itemCost } from "../lib/budget.js";
+import { buildPlan } from "../lib/templates.js";
 
 const MODES = ["wedding", "birthday", "community"] as const;
 

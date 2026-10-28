@@ -1,4 +1,4 @@
-import { handlePlan } from "../src/server/handler";
+import { handlePlan } from "../src/server/handler.js";
 
 // Vercel serverless function. The Gemini key is read from the server environment only.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

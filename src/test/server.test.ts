@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { handlePlan, resetState } from "../server/handler";
-import { generatePlan } from "../server/plan";
-import { aiPlanSchema, requestSchema, sanitize } from "../server/schema";
+import { handlePlan, resetState } from "../server/handler.js";
+import { generatePlan } from "../server/plan.js";
+import { aiPlanSchema, requestSchema, sanitize } from "../server/schema.js";
 
 const req = { mode: "wedding", budget: 300000, guests: 150, reservePct: 10, cutPct: 20, city: "Bengaluru", vibe: "simple" } as const;
 const valid = {

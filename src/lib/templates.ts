@@ -1,4 +1,4 @@
-import type { CostItem, EventMode } from "./types";
+import type { CostItem, EventMode } from "./types.js";
 
 interface Row { id: string; label: string; basis: CostItem["basis"]; weight: number; priority: number; floor: number }
 

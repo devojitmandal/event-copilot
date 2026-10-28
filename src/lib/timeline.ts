@@ -1,4 +1,4 @@
-import type { EventMode } from "./types";
+import type { EventMode } from "./types.js";
 
 export type TaskStatus = "done" | "overdue" | "due_soon" | "upcoming";
 export interface Task { id: string; title: string; daysBefore: number }

@@ -1,5 +1,5 @@
-import { itemCost } from "./budget";
-import type { Basis, CostItem } from "./types";
+import { itemCost } from "./budget.js";
+import type { Basis, CostItem } from "./types.js";
 
 export interface Quote {
     id: string; itemId: string; vendor: string; amount: number; booked: boolean;

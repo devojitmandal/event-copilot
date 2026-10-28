@@ -1,4 +1,4 @@
-import type { CostItem, Cut, Totals } from "./types";
+import type { CostItem, Cut, Totals } from "./types.js";
 
 export const itemCost = (item: CostItem, guests: number): number =>
   Math.round(item.basis === "per_head" ? item.amount * guests : item.amount);

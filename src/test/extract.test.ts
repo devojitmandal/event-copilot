@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { handleExtract, matchesMime, resetExtractState } from "../server/extract";
-import { normaliseAmount } from "../lib/vendors";
+import { handleExtract, matchesMime, resetExtractState } from "../server/extract.js";
+import { normaliseAmount } from "../lib/vendors.js";
 
 const pdf = Buffer.from("%PDF-1.4 sample quotation content").toString("base64");
 const cats = [{ id: "venue", label: "Venue" }, { id: "catering", label: "Catering" }];

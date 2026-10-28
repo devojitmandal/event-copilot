@@ -1,4 +1,4 @@
-import { addDays, buildTimeline, daysBetween, isValidDate } from "../lib/timeline";
+import { addDays, buildTimeline, daysBetween, isValidDate } from "../lib/timeline.js";
 
 describe("timeline", () => {
   it("counts due dates back from the event date", () => {
