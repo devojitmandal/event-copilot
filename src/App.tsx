@@ -248,6 +248,7 @@ export default function App() {
     vibe,
   };
   const key = JSON.stringify(payload);
+  const valid = budget >= 10000 && guests >= 1 && guests <= 5000;
 
   async function generate() {
     setLoading(true);
@@ -652,8 +653,9 @@ export default function App() {
       </section>
 
       <section className="ai-panel">
+      {!valid && <p role="alert">Enter a budget of at least ₹10,000 and between 1 and 5,000 guests.</p>}
         <div className="row">
-          <button className="btn-primary" onClick={generate} disabled={loading}>
+          <button className="btn-primary" onClick={generate} disabled={loading || !valid}>
             {loading ? "Generating…" : "Generate AI plan"}
           </button>
         </div>
