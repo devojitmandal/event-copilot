@@ -38,7 +38,27 @@ export interface QuoteRow extends Quote {
   total: number;
   diff: number;
   best: boolean;
+  /** True when GST is excluded with no rate, so `total` is only a pre-tax subtotal */
+  excludesUnknownGst: boolean;
+  /** True when GST status itself is unknown */
+  gstUnknown: boolean;
 }
+
+export interface ProjectedBreakdown {
+  total: number;
+  /** Categories where the booked quote has `gst: "excluded"` and `gstRatePct: null` */
+  excludedUnknownGstItems: string[];
+  /** Categories where the booked quote has `gst: "unknown"` (or undefined) */
+  unknownGstStatusItems: string[];
+}
+
+/** True if the quote definitely excludes GST whose rate is not yet entered. */
+export const excludesUnknownTax = (q: Pick<Quote, "gst" | "gstRatePct">): boolean =>
+  q.gst === "excluded" && (q.gstRatePct == null || !Number.isFinite(q.gstRatePct));
+
+/** True if the quote's GST status is not yet confirmed ("unknown") or excludes an unknown rate. */
+export const hasUncertainTax = (q: Pick<Quote, "gst" | "gstRatePct">): boolean =>
+  excludesUnknownTax(q) || !q.gst || q.gst === "unknown";
 
 /**
  * Shared calculation for both live quotes and draft previews.
@@ -114,35 +134,75 @@ export function makeQuote(
   return { id, itemId, vendor: name, amount, booked: false, ...extra };
 }
 
-/** diff > 0 means the quote is over the planned amount for that item. */
+/**
+ * diff > 0 means the quote is over the planned amount for that item.
+ * A quote that excludes an unknown GST rate will not falsely steal the `best` ("lowest")
+ * badge from a tax-complete quote unless all quotes in the category also exclude unknown GST.
+ */
 export function compareQuotes(quotes: Quote[], item: CostItem, guests: number, mode?: EventMode): QuoteRow[] {
   const planned = itemCost(item, guests);
-  const rows = quotes
+  const rows: QuoteRow[] = quotes
     .filter((q) => q.itemId === item.id && (!mode || !q.mode || q.mode === mode))
     .map((q) => {
       const total = quoteTotal(q, item, guests);
-      return { ...q, total, diff: total - planned, best: false };
+      return {
+        ...q,
+        total,
+        diff: total - planned,
+        best: false,
+        excludesUnknownGst: excludesUnknownTax(q),
+        gstUnknown: q.gst === "unknown",
+      };
     });
+
   if (rows.length > 1) {
-    const min = Math.min(...rows.map((r) => r.total));
-    const max = Math.max(...rows.map((r) => r.total));
-    if (min < max) {
-      for (const r of rows) {
-        if (r.total === min) r.best = true;
+    // Prefer quotes that do not exclude an unpriced GST rate when awarding "lowest"
+    const eligible = rows.some((r) => !r.excludesUnknownGst)
+      ? rows.filter((r) => !r.excludesUnknownGst)
+      : rows;
+
+    if (eligible.length > 0) {
+      const min = Math.min(...eligible.map((r) => r.total));
+      const max = Math.max(...rows.map((r) => r.total));
+      if (min < max) {
+        for (const r of eligible) {
+          if (r.total === min) r.best = true;
+        }
+      } else {
+        eligible[0].best = true;
       }
-    } else {
-      rows[0].best = true;
     }
   }
   return rows;
 }
 
+/** Detailed projection breakdown including tax-uncertainty warnings for dashboard KPIs. */
+export function projectedSpendDetails(
+  items: CostItem[],
+  quotes: Quote[],
+  guests: number,
+  mode?: EventMode,
+): ProjectedBreakdown {
+  const excludedUnknownGstItems: string[] = [];
+  const unknownGstStatusItems: string[] = [];
+
+  const total = items.reduce((sum, item) => {
+    const booked = quotes.find((q) => q.itemId === item.id && q.booked && (!mode || !q.mode || q.mode === mode));
+    if (!booked) return sum + itemCost(item, guests);
+    if (excludesUnknownTax(booked)) {
+      excludedUnknownGstItems.push(item.label);
+    } else if (booked.gst === "unknown") {
+      unknownGstStatusItems.push(item.label);
+    }
+    return sum + quoteTotal(booked, item, guests);
+  }, 0);
+
+  return { total, excludedUnknownGstItems, unknownGstStatusItems };
+}
+
 /** Planned total, but any item with a booked quote uses that quote instead. */
 export function projectedSpend(items: CostItem[], quotes: Quote[], guests: number, mode?: EventMode): number {
-  return items.reduce((sum, item) => {
-    const booked = quotes.find((q) => q.itemId === item.id && q.booked && (!mode || !q.mode || q.mode === mode));
-    return sum + (booked ? quoteTotal(booked, item, guests) : itemCost(item, guests));
-  }, 0);
+  return projectedSpendDetails(items, quotes, guests, mode).total;
 }
 
 /**

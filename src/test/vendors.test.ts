@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { compareQuotes, makeQuote, normaliseAmount, projectedSpend, quoteTotal } from "../lib/vendors.js";
+import {
+  compareQuotes,
+  makeQuote,
+  normaliseAmount,
+  projectedSpend,
+  projectedSpendDetails,
+  quoteTotal,
+} from "../lib/vendors.js";
 import { buildPlan } from "../lib/templates.js";
 
 const items = buildPlan("wedding", 270000, 150);
@@ -25,7 +32,6 @@ describe("vendor quotes", () => {
   });
 
   it("never assumes 18% when GST is excluded but rate is unknown (null) or 0%", () => {
-    // Unknown GST must not assume 18%
     expect(
       quoteTotal(
         makeQuote("venue", "Vendor", 100000, {
@@ -37,7 +43,6 @@ describe("vendor quotes", () => {
       ),
     ).toBe(100000);
 
-    // Explicit 0% GST must not assume 18%
     expect(
       quoteTotal(
         makeQuote("venue", "Vendor", 100000, {
@@ -49,7 +54,6 @@ describe("vendor quotes", () => {
       ),
     ).toBe(100000);
 
-    // Different known GST rates (5%, 12%, 18%)
     expect(
       quoteTotal(makeQuote("venue", "Vendor", 100000, { gst: "excluded", gstRatePct: 5 })!, venue, 150),
     ).toBe(105000);
@@ -61,15 +65,38 @@ describe("vendor quotes", () => {
     ).toBe(118000);
   });
 
+  it("prevents a quote with excluded unknown GST from falsely winning 'best' over a complete quote", () => {
+    const incompleteTaxQuote = makeQuote("venue", "Untaxed Subtotal Vendor", 100000, {
+      gst: "excluded",
+      gstRatePct: null,
+    })!;
+    const completeTaxQuote = makeQuote("venue", "All-In Vendor", 110000, {
+      gst: "included",
+    })!;
+    const rows = compareQuotes([incompleteTaxQuote, completeTaxQuote], venue, 150);
+    const untaxedRow = rows.find((r) => r.vendor === "Untaxed Subtotal Vendor")!;
+    const allInRow = rows.find((r) => r.vendor === "All-In Vendor")!;
+    expect(untaxedRow.excludesUnknownGst).toBe(true);
+    expect(untaxedRow.best).toBe(false);
+    expect(allInRow.best).toBe(true);
+  });
+
+  it("reports uncertain GST items in projectedSpendDetails so the dashboard never understates risk", () => {
+    const bookedUntaxed = {
+      ...makeQuote("venue", "Hall A", 60000, { mode: "wedding", gst: "excluded", gstRatePct: null })!,
+      booked: true,
+    };
+    const details = projectedSpendDetails(items, [bookedUntaxed], 150, "wedding");
+    expect(details.excludedUnknownGstItems).toEqual(["Venue"]);
+  });
+
   it("calculates per-guest base price plus fixed/per-guest mandatory charges accurately", () => {
-    // Catering base: ₹650 per guest * 150 = ₹97,500 + Mandatory delivery ₹5,000 total = ₹1,02,500
     const q = makeQuote("catering", "Royal Feast", 650, {
       pricingBasis: "per_head",
       mandatoryCharges: [{ name: "Delivery & Setup", amount: 5000, pricing: "total" }],
     })!;
     expect(quoteTotal(q, catering, 150)).toBe(102500);
 
-    // With additional per-guest mandatory charge (₹50/guest * 150 = ₹7,500) -> ₹1,10,000
     const qMixed = makeQuote("catering", "Royal Feast", 650, {
       pricingBasis: "per_head",
       mandatoryCharges: [

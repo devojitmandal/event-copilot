@@ -10,7 +10,7 @@ import {
   computeQuoteTotal,
   makeQuote,
   normaliseAmount,
-  projectedSpend,
+  projectedSpendDetails,
   type GstStatus,
   type MandatoryCharge,
   type OptionalAddOn,
@@ -93,7 +93,6 @@ interface Draft {
   confidence: string;
 }
 
-// Issue #6 Fix: Full Zod validation for saved localStorage state
 const storedQuoteSchema = z.object({
   id: z.string().min(1).max(120),
   itemId: z.string().min(1).max(40),
@@ -180,9 +179,9 @@ function readBase64(file: File): Promise<string> {
   });
 }
 
-// Issue #1 Fix: Never hardcode 18% when GST rate is unknown
 function formatGstBadge(gst?: GstStatus, rate?: number | null): string | null {
-  if (!gst || gst === "unknown") return null;
+  if (!gst) return null;
+  if (gst === "unknown") return "GST status unknown";
   if (gst === "included") {
     return rate != null ? `GST ${rate}% incl.` : "GST incl.";
   }
@@ -227,7 +226,6 @@ export default function App() {
   const [qItem, setQItem] = useState("");
   const [qVendor, setQVendor] = useState("");
   const [qAmount, setQAmount] = useState("");
-  // Issue #2 Fix: 3-state manual GST selection ("unknown" default, "included", "excluded" + explicit rate)
   const [qGstStatus, setQGstStatus] = useState<GstStatus>("unknown");
   const [qGstRate, setQGstRate] = useState<string>("");
   const [qError, setQError] = useState("");
@@ -243,7 +241,6 @@ export default function App() {
   const safeReserve = clampInt(reserve, 0, 20);
   const safeCutPct = clampInt(cutPct, 0, 40);
 
-  // Issue #4 & #5 Fix: Track active mode and live guest count via refs for in-flight extraction checks
   const activeModeRef = useRef<EventMode>(mode);
   activeModeRef.current = mode;
   const activeGuestsRef = useRef<number>(safeGuests);
@@ -347,8 +344,11 @@ export default function App() {
   }
 
   const quoteItem = view.plan.find((i) => i.id === qItem) ?? view.plan[0];
-  const projected = projectedSpend(view.plan, quotes, safeGuests, mode);
+  const projection = projectedSpendDetails(view.plan, quotes, safeGuests, mode);
+  const projected = projection.total;
   const available = view.totals.available;
+  const hasExcludedUnknownGst = projection.excludedUnknownGstItems.length > 0;
+  const hasUnknownGstStatus = projection.unknownGstStatusItems.length > 0;
 
   function addQuote() {
     let parsedRate: number | null = null;
@@ -472,7 +472,6 @@ export default function App() {
       ? Number(activeDraft.gstRatePct)
       : null;
 
-  // Issue #1 Fix: Use the exact same `computeQuoteTotal` function as `quoteTotal()`
   const draftTotal =
     activeDraft && draftItem
       ? computeQuoteTotal(Number(activeDraft.amount || 0), draftItem.basis, safeGuests, {
@@ -519,7 +518,6 @@ export default function App() {
       });
       const out = await res.json().catch(() => ({}));
 
-      // Issue #4 & #5 Fix: Verify request ID, event mode, and guest count haven't changed mid-extraction
       if (reqId !== extractSeqRef.current || activeModeRef.current !== uploadMode) {
         return;
       }
@@ -725,11 +723,19 @@ export default function App() {
         </div>
         <div className="kpi-card">
           <div className="kpi-label">Projected w/ Quotes</div>
-          <div className="kpi-value">{inr(projected)}</div>
+          <div className="kpi-value">
+            {inr(projected)}
+            {hasExcludedUnknownGst ? " + GST" : ""}
+          </div>
           <div className="kpi-meta">
             {projected <= available
               ? `${inr(available - projected)} under available`
               : `${inr(projected - available)} over available`}
+            {hasExcludedUnknownGst
+              ? ` (excludes unpriced GST on ${projection.excludedUnknownGstItems.join(", ")})`
+              : hasUnknownGstStatus
+                ? ` (GST status unconfirmed on ${projection.unknownGstStatusItems.join(", ")})`
+                : ""}
           </div>
         </div>
       </section>
@@ -978,7 +984,6 @@ export default function App() {
           {extracting && <p aria-live="polite">Reading the quotation…</p>}
           {xError && <p role="alert">{xError}</p>}
 
-          {/* Issue #4 Fix: Fully editable quotation review interface */}
           {activeDraft && draftItem && (
             <div className="draft">
               <h3>Review the extracted quote</h3>
@@ -1037,7 +1042,6 @@ export default function App() {
                 )}
               </div>
 
-              {/* Editable Mandatory Charges List */}
               <div className="draft-list-section">
                 <div className="draft-list-header">
                   <span>Mandatory charges (compulsory setup, delivery, etc.)</span>
@@ -1083,7 +1087,6 @@ export default function App() {
                 ))}
               </div>
 
-              {/* Editable Optional Add-Ons List */}
               <div className="draft-list-section">
                 <div className="draft-list-header">
                   <span>Optional add-ons (kept separate from base quote total)</span>
@@ -1172,7 +1175,6 @@ export default function App() {
           )}
         </div>
 
-        {/* Issue #2 Fix: Manual Quote Entry with explicit 3-choice GST status & conditional GST rate input */}
         <div className="grid">
           <label>
             Category
@@ -1250,7 +1252,6 @@ export default function App() {
                 <tbody>
                   {rows.map((r) => {
                     const gstBadge = formatGstBadge(r.gst, r.gstRatePct);
-                    const unknownExcludedGst = r.gst === "excluded" && r.gstRatePct == null;
                     return (
                       <tr key={r.id}>
                         <td>
@@ -1260,7 +1261,11 @@ export default function App() {
                           {gstBadge && (
                             <span
                               className={`chip ${
-                                unknownExcludedGst ? "overdue" : r.gst === "excluded" ? "due_soon" : "good"
+                                r.excludesUnknownGst
+                                  ? "overdue"
+                                  : r.gst === "excluded" || r.gstUnknown
+                                    ? "due_soon"
+                                    : "good"
                               }`}
                             >
                               {gstBadge}
@@ -1296,9 +1301,13 @@ export default function App() {
                         </td>
                         <td>
                           {inr(r.total)}
-                          {unknownExcludedGst && <small>+ unknown GST</small>}
+                          {r.excludesUnknownGst && <small>+ unknown GST</small>}
+                          {r.gstUnknown && <small>GST unconfirmed</small>}
                         </td>
-                        <td>{r.diff > 0 ? `${inr(r.diff)} over` : `${inr(-r.diff)} under`}</td>
+                        <td>
+                          {r.diff > 0 ? `${inr(r.diff)} over` : `${inr(-r.diff)} under`}
+                          {r.excludesUnknownGst ? " (excl. GST)" : ""}
+                        </td>
                         <td>
                           <button onClick={() => setBooked(r.id)}>{r.booked ? "Unbook" : "Book"}</button>{" "}
                           <button
@@ -1319,8 +1328,18 @@ export default function App() {
         })}
 
         <p className="projected-banner">
-          Projected spend with booked quotes: {inr(projected)} of {inr(available)} available (
-          {projected <= available ? `${inr(available - projected)} left` : `${inr(projected - available)} over`}).
+          <span>
+            Projected spend with booked quotes: {inr(projected)}
+            {hasExcludedUnknownGst ? " (+ unpriced GST)" : ""} of {inr(available)} available (
+            {projected <= available ? `${inr(available - projected)} left` : `${inr(projected - available)} over`}).
+          </span>
+          {(hasExcludedUnknownGst || hasUnknownGstStatus) && (
+            <small className="tax-warning-inline">
+              {hasExcludedUnknownGst
+                ? `⚠️ Excludes unknown GST rate on: ${projection.excludedUnknownGstItems.join(", ")}.`
+                : `⚠️ GST status unconfirmed on: ${projection.unknownGstStatusItems.join(", ")}.`}
+            </small>
+          )}
         </p>
       </section>
 
