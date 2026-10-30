@@ -1,12 +1,31 @@
-import { useMemo, useState, type ChangeEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import { applyBudgetCut, computeTotals, fitToBudget, itemCost } from "./lib/budget";
 import { buildPlan } from "./lib/templates";
 import type { EventMode } from "./lib/types";
 import type { PlanResult } from "./server/plan";
 import { addDays, buildTimeline, isValidDate, localToday } from "./lib/timeline";
-import { compareQuotes, makeQuote, normaliseAmount, projectedSpend, type Quote } from "./lib/vendors";
+import {
+  compareQuotes,
+  makeQuote,
+  normaliseAmount,
+  projectedSpend,
+  type GstStatus,
+  type OptionalAddOn,
+  type Quote,
+} from "./lib/vendors";
 
-const inr = (n: number) => "₹" + n.toLocaleString("en-IN");
+const inr = (n: number) => "₹" + Math.round(n).toLocaleString("en-IN");
+
+const MIN_BUDGET = 10_000;
+const MAX_BUDGET = 100_000_000;
+const MIN_GUESTS = 1;
+const MAX_GUESTS = 5_000;
+const STORAGE_KEY = "event-copilot-state-v1";
+
+const clampInt = (val: number, min: number, max: number): number => {
+  if (!Number.isFinite(val)) return min;
+  return Math.min(max, Math.max(min, Math.round(val)));
+};
 
 const MODE_ICONS: Record<EventMode, string> = {
   wedding: "✦",
@@ -42,14 +61,46 @@ const VIBE_PRESETS: Record<EventMode, { label: string; value: string }[]> = {
 const CITY_PRESETS = ["Bengaluru", "Mumbai", "Delhi NCR", "Kolkata", "Chennai", "Hyderabad", "Pune", "Jaipur"];
 
 interface Draft {
+  mode: EventMode;
   itemId: string;
   vendor: string;
   amount: string;
+  rawAmount: number | null;
+  rawPricing: "total" | "per_guest" | "unknown";
+  baseAmount: number | null;
+  mandatoryCharges: number | null;
+  gst: GstStatus;
+  gstRatePct: number | null;
+  optionalAddOns: OptionalAddOn[];
+  overtimeRates: string[];
   inclusions: string;
   exclusions: string;
   paymentTerms: string;
   note: string;
   confidence: string;
+}
+
+interface StoredState {
+  mode?: EventMode;
+  budget?: number;
+  guests?: number;
+  reserve?: number;
+  cutPct?: number;
+  city?: string;
+  vibe?: string;
+  eventDate?: string;
+  quotesByMode?: Record<EventMode, Quote[]>;
+  doneByMode?: Record<EventMode, string[]>;
+}
+
+function loadSavedState(): StoredState | null {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return null;
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as StoredState) : null;
+  } catch {
+    return null;
+  }
 }
 
 const ACCEPT = ["application/pdf", "image/png", "image/jpeg", "image/webp"];
@@ -64,20 +115,41 @@ function readBase64(file: File): Promise<string> {
   });
 }
 
+function formatGstBadge(gst?: GstStatus, rate?: number | null): string | null {
+  if (!gst || gst === "unknown") return null;
+  const rateText = rate != null ? ` ${rate}%` : " 18%";
+  return gst === "included" ? `GST${rate != null ? ` ${rate}%` : ""} incl.` : `+ GST${rateText} extra (included in total)`;
+}
+
 export default function App() {
-  const [mode, setMode] = useState<EventMode>("wedding");
-  const [budget, setBudget] = useState(300000);
-  const [guests, setGuests] = useState(150);
-  const [reserve, setReserve] = useState(10);
-  const [cutPct, setCutPct] = useState(0);
-  const [city, setCity] = useState("");
-  const [vibe, setVibe] = useState("");
-  const [eventDate, setEventDate] = useState(() => addDays(localToday(), 120));
-  const [done, setDone] = useState<Set<string>>(new Set());
-  const [quotes, setQuotes] = useState<Quote[]>([]);
+  const saved = useMemo(() => loadSavedState(), []);
+
+  const [mode, setMode] = useState<EventMode>(saved?.mode ?? "wedding");
+  const [budget, setBudget] = useState<number>(saved?.budget ?? 300000);
+  const [budgetInput, setBudgetInput] = useState<string>(String(saved?.budget ?? 300000));
+  const [guests, setGuests] = useState<number>(saved?.guests ?? 150);
+  const [guestsInput, setGuestsInput] = useState<string>(String(saved?.guests ?? 150));
+  const [reserve, setReserve] = useState<number>(saved?.reserve ?? 10);
+  const [cutPct, setCutPct] = useState<number>(saved?.cutPct ?? 0);
+  const [city, setCity] = useState<string>(saved?.city ?? "");
+  const [vibe, setVibe] = useState<string>(saved?.vibe ?? "");
+  const [eventDate, setEventDate] = useState<string>(() =>
+    saved?.eventDate && isValidDate(saved.eventDate) ? saved.eventDate : addDays(localToday(), 120),
+  );
+  const [doneByMode, setDoneByMode] = useState<Record<EventMode, Set<string>>>(() => ({
+    wedding: new Set(saved?.doneByMode?.wedding ?? []),
+    birthday: new Set(saved?.doneByMode?.birthday ?? []),
+    community: new Set(saved?.doneByMode?.community ?? []),
+  }));
+  const [quotesByMode, setQuotesByMode] = useState<Record<EventMode, Quote[]>>(() => ({
+    wedding: saved?.quotesByMode?.wedding ?? [],
+    birthday: saved?.quotesByMode?.birthday ?? [],
+    community: saved?.quotesByMode?.community ?? [],
+  }));
   const [qItem, setQItem] = useState("");
   const [qVendor, setQVendor] = useState("");
   const [qAmount, setQAmount] = useState("");
+  const [qGstExtra, setQGstExtra] = useState(false);
   const [qError, setQError] = useState("");
   const [draft, setDraft] = useState<Draft | null>(null);
   const [extracting, setExtracting] = useState(false);
@@ -86,20 +158,70 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
+  const activeModeRef = useRef<EventMode>(mode);
+  activeModeRef.current = mode;
+  const extractSeqRef = useRef(0);
+
+  const safeBudget = clampInt(budget, MIN_BUDGET, MAX_BUDGET);
+  const safeGuests = clampInt(guests, MIN_GUESTS, MAX_GUESTS);
+  const safeReserve = clampInt(reserve, 0, 20);
+  const safeCutPct = clampInt(cutPct, 0, 40);
+
+  // Persist user work to localStorage so accidental refreshes never wipe quotes or tasks
+  useEffect(() => {
+    try {
+      if (typeof window === "undefined" || !window.localStorage) return;
+      const toStore: StoredState = {
+        mode,
+        budget: safeBudget,
+        guests: safeGuests,
+        reserve: safeReserve,
+        cutPct: safeCutPct,
+        city,
+        vibe,
+        eventDate,
+        quotesByMode,
+        doneByMode: {
+          wedding: [...doneByMode.wedding],
+          birthday: [...doneByMode.birthday],
+          community: [...doneByMode.community],
+        },
+      };
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(toStore));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }, [mode, safeBudget, safeGuests, safeReserve, safeCutPct, city, vibe, eventDate, quotesByMode, doneByMode]);
+
+  const quotes = quotesByMode[mode];
+  const done = doneByMode[mode];
+
+  function handleModeChange(nextMode: EventMode) {
+    if (nextMode === mode) return;
+    if (extracting) {
+      extractSeqRef.current += 1;
+      setExtracting(false);
+      setXError(`Switched to ${nextMode} mode. Previous quote upload was cancelled.`);
+    }
+    setDraft(null);
+    setQError("");
+    setMode(nextMode);
+  }
+
   const view = useMemo(() => {
-    const base = computeTotals([], guests, budget, reserve);
-    const plan = buildPlan(mode, base.available, guests);
-    const newBudget = applyBudgetCut(budget, cutPct);
-    const target = computeTotals([], guests, newBudget, reserve).available;
-    const fit = fitToBudget(plan, guests, target);
+    const base = computeTotals([], safeGuests, safeBudget, safeReserve);
+    const plan = buildPlan(mode, base.available, safeGuests);
+    const newBudget = applyBudgetCut(safeBudget, safeCutPct);
+    const target = computeTotals([], safeGuests, newBudget, safeReserve).available;
+    const fit = fitToBudget(plan, safeGuests, target);
     return {
       plan: fit.items,
       cuts: fit.cuts,
       shortfall: fit.shortfall,
       newBudget,
-      totals: computeTotals(fit.items, guests, newBudget, reserve),
+      totals: computeTotals(fit.items, safeGuests, newBudget, safeReserve),
     };
-  }, [mode, budget, guests, reserve, cutPct]);
+  }, [mode, safeBudget, safeGuests, safeReserve, safeCutPct]);
 
   const today = localToday();
   const timeline = useMemo(
@@ -109,11 +231,11 @@ export default function App() {
   const overdue = timeline.filter((t) => t.status === "overdue").length;
 
   function toggle(id: string) {
-    setDone((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
+    setDoneByMode((prev) => {
+      const nextSet = new Set(prev[mode]);
+      if (nextSet.has(id)) nextSet.delete(id);
+      else nextSet.add(id);
+      return { ...prev, [mode]: nextSet };
     });
   }
 
@@ -132,38 +254,74 @@ export default function App() {
   }
 
   const quoteItem = view.plan.find((i) => i.id === qItem) ?? view.plan[0];
-  const projected = projectedSpend(view.plan, quotes, guests);
+  const projected = projectedSpend(view.plan, quotes, safeGuests, mode);
   const available = view.totals.available;
 
   function addQuote() {
-    const q = makeQuote(quoteItem.id, qVendor, Number(qAmount));
+    const q = makeQuote(quoteItem.id, qVendor, Number(qAmount), {
+      mode,
+      pricingBasis: quoteItem.basis,
+      gst: qGstExtra ? "excluded" : "included",
+      gstRatePct: qGstExtra ? 18 : null,
+    });
     if (!q) {
-      setQError("Enter a vendor name and an amount above 0.");
+      setQError("Enter a vendor name and an amount between ₹1 and ₹10,00,00,000.");
       return;
     }
     setQError("");
-    setQuotes((p) => [...p, q]);
+    setQuotesByMode((prev) => ({ ...prev, [mode]: [...prev[mode], q] }));
     setQVendor("");
     setQAmount("");
+    setQGstExtra(false);
   }
 
   function setBooked(id: string) {
-    setQuotes((prev) => {
-      const target = prev.find((q) => q.id === id);
+    setQuotesByMode((prev) => {
+      const current = prev[mode];
+      const target = current.find((q) => q.id === id);
       if (!target) return prev;
-      return prev.map((q) =>
+      const updated = current.map((q) =>
         q.itemId !== target.itemId ? q : q.id === id ? { ...q, booked: !q.booked } : { ...q, booked: false },
       );
+      return { ...prev, [mode]: updated };
     });
   }
 
-  const removeQuote = (id: string) => setQuotes((p) => p.filter((q) => q.id !== id));
+  const removeQuote = (id: string) =>
+    setQuotesByMode((prev) => ({ ...prev, [mode]: prev[mode].filter((q) => q.id !== id) }));
 
-  const draftItem = draft ? view.plan.find((i) => i.id === draft.itemId) ?? quoteItem : null;
-  const upd = (k: keyof Draft, v: string) => setDraft((d) => (d ? { ...d, [k]: v } : d));
-  const draftPlanned = draftItem ? itemCost(draftItem, guests) : 0;
-  const draftTotal =
-    draft && draftItem ? Math.round(Number(draft.amount || 0) * (draftItem.basis === "per_head" ? guests : 1)) : 0;
+  const activeDraft = draft && draft.mode === mode ? draft : null;
+  const draftItem = activeDraft ? view.plan.find((i) => i.id === activeDraft.itemId) ?? quoteItem : null;
+
+  function upd(k: keyof Draft, v: string) {
+    setDraft((d) => {
+      if (!d) return null;
+      if (k === "itemId") {
+        const nextItem = view.plan.find((i) => i.id === v);
+        if (nextItem && d.rawAmount != null) {
+          const norm = normaliseAmount(d.rawPricing, d.rawAmount, nextItem.basis, safeGuests);
+          return {
+            ...d,
+            itemId: v,
+            amount: norm.amount != null ? String(norm.amount) : d.amount,
+            note: norm.note,
+          };
+        }
+      }
+      return { ...d, [k]: v };
+    });
+  }
+
+  const draftPlanned = draftItem ? itemCost(draftItem, safeGuests) : 0;
+  const draftBaseTotal =
+    activeDraft && draftItem
+      ? Number(activeDraft.amount || 0) * (draftItem.basis === "per_head" ? safeGuests : 1)
+      : 0;
+  const draftGstMultiplier =
+    activeDraft?.gst === "excluded"
+      ? 1 + (activeDraft.gstRatePct != null && activeDraft.gstRatePct > 0 ? activeDraft.gstRatePct : 18) / 100
+      : 1;
+  const draftTotal = Math.round(draftBaseTotal * draftGstMultiplier);
   const draftSuspicious = draftTotal > available;
 
   async function onFile(e: ChangeEvent<HTMLInputElement>) {
@@ -180,6 +338,13 @@ export default function App() {
       setXError("File is too large. Keep it under 3 MB.");
       return;
     }
+
+    const uploadMode = mode;
+    const uploadGuests = safeGuests;
+    const uploadPlanSnapshot = view.plan;
+    const uploadCategories = uploadPlanSnapshot.map((i) => ({ id: i.id, label: i.label }));
+    const reqId = ++extractSeqRef.current;
+
     setExtracting(true);
     try {
       const data = await readBase64(file);
@@ -189,68 +354,124 @@ export default function App() {
         body: JSON.stringify({
           mimeType: file.type,
           data,
-          categories: view.plan.map((i) => ({ id: i.id, label: i.label })),
+          categories: uploadCategories,
         }),
       });
       const out = await res.json().catch(() => ({}));
+
+      if (reqId !== extractSeqRef.current || activeModeRef.current !== uploadMode) {
+        return;
+      }
+
       if (!res.ok) throw new Error(out.error ?? "The server had a problem. Please try again.");
       const d = out.draft;
-      const item = view.plan.find((i) => i.id === d.categoryId) ?? quoteItem;
-      const norm = normaliseAmount(d.pricing, d.amount, item.basis, guests);
+      const matchedItem = uploadPlanSnapshot.find((i) => i.id === d.categoryId) ?? uploadPlanSnapshot[0];
+      const rawAmount: number | null = d.amount ?? d.baseAmount ?? null;
+      const norm = normaliseAmount(d.pricing, rawAmount, matchedItem.basis, uploadGuests);
+
       setDraft({
-        itemId: item.id,
+        mode: uploadMode,
+        itemId: matchedItem.id,
         vendor: d.vendor ?? "",
-        amount: norm.amount ? String(norm.amount) : "",
-        inclusions: d.inclusions.join("\n"),
-        exclusions: d.exclusions.join("\n"),
+        amount: norm.amount != null ? String(norm.amount) : "",
+        rawAmount,
+        rawPricing: d.pricing ?? "unknown",
+        baseAmount: d.baseAmount ?? rawAmount,
+        mandatoryCharges: d.mandatoryCharges ?? null,
+        gst: d.gst ?? "unknown",
+        gstRatePct: d.gstRatePct ?? null,
+        optionalAddOns: Array.isArray(d.optionalAddOns) ? d.optionalAddOns : [],
+        overtimeRates: Array.isArray(d.overtimeRates) ? d.overtimeRates : [],
+        inclusions: Array.isArray(d.inclusions) ? d.inclusions.join("\n") : "",
+        exclusions: Array.isArray(d.exclusions) ? d.exclusions.join("\n") : "",
         paymentTerms: d.paymentTerms ?? "",
         note: norm.note,
-        confidence: d.confidence,
+        confidence: d.confidence ?? "low",
       });
     } catch (err) {
+      if (reqId !== extractSeqRef.current || activeModeRef.current !== uploadMode) {
+        return;
+      }
       setXError(
         (err instanceof Error ? err.message : "Extraction failed.") + " You can enter the quote manually below.",
       );
     } finally {
-      setExtracting(false);
+      if (reqId === extractSeqRef.current) {
+        setExtracting(false);
+      }
     }
   }
 
   function confirmDraft() {
-    if (!draft) return;
+    if (!activeDraft || !draftItem) return;
     const lines = (s: string) =>
       s
         .split("\n")
         .map((x) => x.trim().slice(0, 120))
         .filter(Boolean)
         .slice(0, 10);
-    const q = makeQuote(draft.itemId, draft.vendor, Number(draft.amount), {
-      inclusions: lines(draft.inclusions),
-      exclusions: lines(draft.exclusions),
-      paymentTerms: draft.paymentTerms.trim().slice(0, 300),
+
+    // If user didn't manually override the normalised amount and the vendor's original pricing unit is known,
+    // preserve the vendor's exact pricing basis (total vs per_guest) so future guest count edits don't distort fixed quotes.
+    const expectedNorm = normaliseAmount(activeDraft.rawPricing, activeDraft.rawAmount, draftItem.basis, safeGuests);
+    const amountUnchanged =
+      activeDraft.rawAmount != null &&
+      expectedNorm.amount != null &&
+      Math.abs(Number(activeDraft.amount) - expectedNorm.amount) < 0.001;
+
+    const useOriginalBasis =
+      amountUnchanged && (activeDraft.rawPricing === "total" || activeDraft.rawPricing === "per_guest");
+    const finalAmount = useOriginalBasis ? activeDraft.rawAmount! : Number(activeDraft.amount);
+    const finalBasis = useOriginalBasis
+      ? activeDraft.rawPricing === "per_guest"
+        ? "per_head"
+        : "fixed"
+      : draftItem.basis;
+
+    const q = makeQuote(activeDraft.itemId, activeDraft.vendor, finalAmount, {
+      mode: activeDraft.mode,
+      pricingBasis: finalBasis,
+      baseAmount: activeDraft.baseAmount ?? undefined,
+      mandatoryCharges: activeDraft.mandatoryCharges ?? undefined,
+      gst: activeDraft.gst,
+      gstRatePct: activeDraft.gstRatePct,
+      optionalAddOns: activeDraft.optionalAddOns,
+      overtimeRates: activeDraft.overtimeRates,
+      inclusions: lines(activeDraft.inclusions),
+      exclusions: lines(activeDraft.exclusions),
+      paymentTerms: activeDraft.paymentTerms.trim().slice(0, 300),
     });
     if (!q) {
       setXError("A vendor name and an amount above 0 are required.");
       return;
     }
-    setQuotes((p) => [...p, q]);
+    setQuotesByMode((prev) => ({ ...prev, [activeDraft.mode]: [...prev[activeDraft.mode], q] }));
     setDraft(null);
     setXError("");
   }
 
   const payload = {
     mode,
-    budget: Math.round(budget),
-    guests: Math.round(guests),
-    reservePct: reserve,
-    cutPct,
-    city,
-    vibe,
+    budget: safeBudget,
+    guests: safeGuests,
+    reservePct: safeReserve,
+    cutPct: safeCutPct,
+    city: city.trim().slice(0, 60),
+    vibe: vibe.trim().slice(0, 200),
   };
   const key = JSON.stringify(payload);
-  const valid = budget >= 10000 && guests >= 1 && guests <= 5000;
 
   async function generate() {
+    const parsedBudget = Number(budgetInput);
+    const parsedGuests = Number(guestsInput);
+    if (!Number.isInteger(parsedBudget) || parsedBudget < MIN_BUDGET || parsedBudget > MAX_BUDGET) {
+      setError("Budget must be a whole rupee amount between ₹10,000 and ₹10,00,00,000.");
+      return;
+    }
+    if (!Number.isInteger(parsedGuests) || parsedGuests < MIN_GUESTS || parsedGuests > MAX_GUESTS) {
+      setError("Guests must be a whole number between 1 and 5,000.");
+      return;
+    }
     setLoading(true);
     setError("");
     try {
@@ -271,7 +492,7 @@ export default function App() {
 
   const stale = ai && ai.key !== key;
   const reasons = new Map(ai?.result.plan.cutExplanations.map((c) => [c.id, c.reason]));
-  const perGuestPlanned = guests > 0 ? Math.round(view.totals.planned / guests) : 0;
+  const perGuestPlanned = safeGuests > 0 ? Math.round(view.totals.planned / safeGuests) : 0;
 
   return (
     <main>
@@ -281,11 +502,19 @@ export default function App() {
         <p className="sub">Budget-first planning. Estimates only: enter real vendor quotes as you get them.</p>
 
         <div className="row mode-bar">
-          {(["wedding", "birthday", "community"] as const).map((m) => (
-            <button key={m} aria-pressed={mode === m} onClick={() => setMode(m)}>
-              <span aria-hidden="true">{MODE_ICONS[m]}</span> {m}
-            </button>
-          ))}
+          {(["wedding", "birthday", "community"] as const).map((m) => {
+            const modeQuoteCount = quotesByMode[m].length;
+            return (
+              <button key={m} aria-pressed={mode === m} onClick={() => handleModeChange(m)}>
+                <span aria-hidden="true">{MODE_ICONS[m]}</span> {m}
+                {modeQuoteCount > 0 && (
+                  <span className="mode-badge" aria-label={`${modeQuoteCount} quotes`}>
+                    {modeQuoteCount}
+                  </span>
+                )}
+              </button>
+            );
+          })}
         </div>
       </header>
 
@@ -298,7 +527,7 @@ export default function App() {
         <div className="kpi-card">
           <div className="kpi-label">Total Planned</div>
           <div className="kpi-value">{inr(view.totals.planned)}</div>
-          <div className="kpi-meta">~{inr(perGuestPlanned)} per guest ({guests} guests)</div>
+          <div className="kpi-meta">~{inr(perGuestPlanned)} per guest ({safeGuests} guests)</div>
         </div>
         <div className="kpi-card">
           <div className="kpi-label">Projected w/ Quotes</div>
@@ -315,19 +544,71 @@ export default function App() {
         <div className="grid">
           <label>
             Budget (₹)
-            <input type="number" min={10000} value={budget} onChange={(e) => setBudget(+e.target.value)} />
+            <input
+              type="number"
+              min={MIN_BUDGET}
+              max={MAX_BUDGET}
+              step={1}
+              value={budgetInput}
+              onChange={(e) => {
+                const rawStr = e.target.value;
+                setBudgetInput(rawStr);
+                const parsed = Number(rawStr);
+                if (rawStr !== "" && Number.isFinite(parsed)) {
+                  setBudget(parsed);
+                }
+              }}
+              onBlur={() => {
+                const clamped = clampInt(Number(budgetInput), MIN_BUDGET, MAX_BUDGET);
+                setBudget(clamped);
+                setBudgetInput(String(clamped));
+              }}
+            />
           </label>
           <label>
             Guests
-            <input type="number" min={1} value={guests} onChange={(e) => setGuests(+e.target.value)} />
+            <input
+              type="number"
+              min={MIN_GUESTS}
+              max={MAX_GUESTS}
+              step={1}
+              value={guestsInput}
+              onChange={(e) => {
+                const rawStr = e.target.value;
+                setGuestsInput(rawStr);
+                const parsed = Number(rawStr);
+                if (rawStr !== "" && Number.isFinite(parsed)) {
+                  setGuests(parsed);
+                }
+              }}
+              onBlur={() => {
+                const clamped = clampInt(Number(guestsInput), MIN_GUESTS, MAX_GUESTS);
+                setGuests(clamped);
+                setGuestsInput(String(clamped));
+              }}
+            />
           </label>
           <label>
-            Reserve ({reserve}%)
-            <input type="range" min={0} max={20} value={reserve} onChange={(e) => setReserve(+e.target.value)} />
+            Reserve ({safeReserve}%)
+            <input
+              type="range"
+              min={0}
+              max={20}
+              step={1}
+              value={safeReserve}
+              onChange={(e) => setReserve(clampInt(+e.target.value, 0, 20))}
+            />
           </label>
           <label>
-            Cut budget by {cutPct}%
-            <input type="range" min={0} max={40} value={cutPct} onChange={(e) => setCutPct(+e.target.value)} />
+            Cut budget by {safeCutPct}%
+            <input
+              type="range"
+              min={0}
+              max={40}
+              step={1}
+              value={safeCutPct}
+              onChange={(e) => setCutPct(clampInt(+e.target.value, 0, 40))}
+            />
           </label>
           <label>
             Event date
@@ -414,7 +695,7 @@ export default function App() {
             </thead>
             <tbody>
               {view.plan.map((i) => {
-                const cost = itemCost(i, guests);
+                const cost = itemCost(i, safeGuests);
                 const pct = view.totals.planned > 0 ? Math.min(100, Math.round((cost / view.totals.planned) * 100)) : 0;
                 return (
                   <tr key={i.id}>
@@ -489,7 +770,7 @@ export default function App() {
       </div>
 
       <section className="panel">
-        <h2>✦ Vendor quotes</h2>
+        <h2>✦ Vendor quotes ({mode})</h2>
         <div className="upload">
           <label>
             Upload a quotation (PDF, PNG, JPG or WebP, up to 3 MB)
@@ -502,17 +783,42 @@ export default function App() {
           </label>
           {extracting && <p aria-live="polite">Reading the quotation…</p>}
           {xError && <p role="alert">{xError}</p>}
-          {draft && draftItem && (
+          {activeDraft && draftItem && (
             <div className="draft">
               <h3>Review the extracted quote</h3>
               <p className="sub">
-                AI confidence: {draft.confidence}. Check every field before saving. If you change the category,
-                re-check the amount.{draft.note && ` ${draft.note}`}
+                AI confidence: {activeDraft.confidence}. Base package price is kept separate from optional add-ons.
+                {activeDraft.note && ` ${activeDraft.note}`}
               </p>
+
+              <div className="breakdown-badges">
+                {activeDraft.baseAmount != null && (
+                  <span className="chip">Base: {inr(activeDraft.baseAmount)}</span>
+                )}
+                {activeDraft.mandatoryCharges != null && activeDraft.mandatoryCharges > 0 && (
+                  <span className="chip due_soon">Mandatory fees: +{inr(activeDraft.mandatoryCharges)}</span>
+                )}
+                {formatGstBadge(activeDraft.gst, activeDraft.gstRatePct) && (
+                  <span className={`chip ${activeDraft.gst === "excluded" ? "due_soon" : "good"}`}>
+                    {formatGstBadge(activeDraft.gst, activeDraft.gstRatePct)}
+                  </span>
+                )}
+                {activeDraft.optionalAddOns.map((addon, idx) => (
+                  <span key={idx} className="chip addon-chip">
+                    Optional: {addon.name} {addon.amount != null ? `(${inr(addon.amount)})` : ""}
+                  </span>
+                ))}
+                {activeDraft.overtimeRates.map((ot, idx) => (
+                  <span key={idx} className="chip addon-chip">
+                    Overtime: {ot}
+                  </span>
+                ))}
+              </div>
+
               <div className="grid">
                 <label>
                   Category
-                  <select value={draft.itemId} onChange={(e) => upd("itemId", e.target.value)}>
+                  <select value={activeDraft.itemId} onChange={(e) => upd("itemId", e.target.value)}>
                     {view.plan.map((i) => (
                       <option key={i.id} value={i.id}>
                         {i.label}
@@ -522,20 +828,23 @@ export default function App() {
                 </label>
                 <label>
                   Vendor
-                  <input maxLength={60} value={draft.vendor} onChange={(e) => upd("vendor", e.target.value)} />
+                  <input maxLength={60} value={activeDraft.vendor} onChange={(e) => upd("vendor", e.target.value)} />
                 </label>
                 <label>
-                  {draftItem.basis === "per_head" ? "Quote per guest (₹)" : "Quote total (₹)"}
+                  {draftItem.basis === "per_head" ? "Base quote per guest (₹)" : "Base quote total (₹)"}
                   <input
                     type="number"
                     min={1}
-                    value={draft.amount}
+                    max={MAX_BUDGET}
+                    step="any"
+                    value={activeDraft.amount}
                     onChange={(e) => upd("amount", e.target.value)}
                   />
                 </label>
               </div>
               <p className="sub">
-                Total for {guests} guests: <strong>{inr(draftTotal)}</strong> (plan: {inr(draftPlanned)}).
+                Total for {safeGuests} guests{activeDraft.gst === "excluded" ? " (incl. GST)" : ""}:{" "}
+                <strong>{inr(draftTotal)}</strong> (plan: {inr(draftPlanned)}).
               </p>
               {draftSuspicious && (
                 <p role="alert">
@@ -544,17 +853,17 @@ export default function App() {
               )}
               <label>
                 Includes (one per line)
-                <textarea rows={3} value={draft.inclusions} onChange={(e) => upd("inclusions", e.target.value)} />
+                <textarea rows={3} value={activeDraft.inclusions} onChange={(e) => upd("inclusions", e.target.value)} />
               </label>
               <label>
                 Excludes (one per line)
-                <textarea rows={3} value={draft.exclusions} onChange={(e) => upd("exclusions", e.target.value)} />
+                <textarea rows={3} value={activeDraft.exclusions} onChange={(e) => upd("exclusions", e.target.value)} />
               </label>
               <label>
                 Payment terms
                 <input
                   maxLength={300}
-                  value={draft.paymentTerms}
+                  value={activeDraft.paymentTerms}
                   onChange={(e) => upd("paymentTerms", e.target.value)}
                 />
               </label>
@@ -587,24 +896,35 @@ export default function App() {
           </label>
           <label>
             {quoteItem.basis === "per_head" ? "Quote per guest (₹)" : "Quote total (₹)"}
-            <input type="number" min={1} value={qAmount} onChange={(e) => setQAmount(e.target.value)} />
+            <input
+              type="number"
+              min={1}
+              max={MAX_BUDGET}
+              step="any"
+              value={qAmount}
+              onChange={(e) => setQAmount(e.target.value)}
+            />
           </label>
         </div>
         <div className="row">
           <button className="btn-primary" onClick={addQuote}>
             Add quote
           </button>
+          <label className="task" style={{ fontSize: "0.84rem", marginLeft: "0.5rem" }}>
+            <input type="checkbox" checked={qGstExtra} onChange={(e) => setQGstExtra(e.target.checked)} />
+            <span>+18% GST extra</span>
+          </label>
         </div>
         {qError && <p role="alert">{qError}</p>}
 
         {view.plan.map((item) => {
-          const rows = compareQuotes(quotes, item, guests);
+          const rows = compareQuotes(quotes, item, safeGuests, mode);
           if (rows.length === 0) return null;
           return (
             <div key={item.id} className="quote-group">
               <h3>
                 {item.label}
-                <small>Planned {inr(itemCost(item, guests))}</small>
+                <small>Planned {inr(itemCost(item, safeGuests))}</small>
               </h3>
               <table>
                 <thead>
@@ -616,30 +936,55 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map((r) => (
-                    <tr key={r.id}>
-                      <td>
-                        {r.vendor}
-                        {r.best && <span className="chip good">lowest</span>}
-                        {r.booked && <span className="chip due_soon">booked</span>}
-                        {r.inclusions?.length ? <small>Includes: {r.inclusions.join(", ")}</small> : null}
-                        {r.exclusions?.length ? <small>Excludes: {r.exclusions.join(", ")}</small> : null}
-                        {r.paymentTerms ? <small>Payment: {r.paymentTerms}</small> : null}
-                      </td>
-                      <td>{inr(r.total)}</td>
-                      <td>{r.diff > 0 ? `${inr(r.diff)} over` : `${inr(-r.diff)} under`}</td>
-                      <td>
-                        <button onClick={() => setBooked(r.id)}>{r.booked ? "Unbook" : "Book"}</button>{" "}
-                        <button
-                          className="btn-ghost"
-                          onClick={() => removeQuote(r.id)}
-                          aria-label={`Remove ${r.vendor}`}
-                        >
-                          Remove
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                  {rows.map((r) => {
+                    const gstBadge = formatGstBadge(r.gst, r.gstRatePct);
+                    return (
+                      <tr key={r.id}>
+                        <td>
+                          {r.vendor}
+                          {r.best && <span className="chip good">lowest</span>}
+                          {r.booked && <span className="chip due_soon">booked</span>}
+                          {gstBadge && (
+                            <span className={`chip ${r.gst === "excluded" ? "due_soon" : "good"}`}>{gstBadge}</span>
+                          )}
+                          {r.mandatoryCharges != null && r.mandatoryCharges > 0 && (
+                            <small>
+                              Base: {inr(r.baseAmount ?? r.amount - r.mandatoryCharges)} + Mandatory fees:{" "}
+                              {inr(r.mandatoryCharges)}
+                            </small>
+                          )}
+                          {r.optionalAddOns && r.optionalAddOns.length > 0 && (
+                            <div className="breakdown-badges">
+                              {r.optionalAddOns.map((addon, idx) => (
+                                <span key={idx} className="chip addon-chip">
+                                  Optional: {addon.name}
+                                  {addon.amount != null ? ` (${inr(addon.amount)})` : ""}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                          {r.overtimeRates && r.overtimeRates.length > 0 && (
+                            <small>Overtime: {r.overtimeRates.join(" • ")}</small>
+                          )}
+                          {r.inclusions?.length ? <small>Includes: {r.inclusions.join(", ")}</small> : null}
+                          {r.exclusions?.length ? <small>Excludes: {r.exclusions.join(", ")}</small> : null}
+                          {r.paymentTerms ? <small>Payment: {r.paymentTerms}</small> : null}
+                        </td>
+                        <td>{inr(r.total)}</td>
+                        <td>{r.diff > 0 ? `${inr(r.diff)} over` : `${inr(-r.diff)} under`}</td>
+                        <td>
+                          <button onClick={() => setBooked(r.id)}>{r.booked ? "Unbook" : "Book"}</button>{" "}
+                          <button
+                            className="btn-ghost"
+                            onClick={() => removeQuote(r.id)}
+                            aria-label={`Remove ${r.vendor}`}
+                          >
+                            Remove
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -653,9 +998,8 @@ export default function App() {
       </section>
 
       <section className="ai-panel">
-      {!valid && <p role="alert">Enter a budget of at least ₹10,000 and between 1 and 5,000 guests.</p>}
         <div className="row">
-          <button className="btn-primary" onClick={generate} disabled={loading || !valid}>
+          <button className="btn-primary" onClick={generate} disabled={loading}>
             {loading ? "Generating…" : "Generate AI plan"}
           </button>
         </div>
