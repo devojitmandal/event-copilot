@@ -6,6 +6,12 @@ export interface OptionalAddOn {
   amount: number | null;
 }
 
+export interface MandatoryCharge {
+  name: string;
+  amount: number;
+  pricing: "total" | "per_guest";
+}
+
 export type GstStatus = "included" | "excluded" | "unknown";
 
 export interface Quote {
@@ -18,7 +24,7 @@ export interface Quote {
   /** Optional override if the vendor priced this differently than the category's default basis */
   pricingBasis?: Basis;
   baseAmount?: number;
-  mandatoryCharges?: number;
+  mandatoryCharges?: MandatoryCharge[];
   gst?: GstStatus;
   gstRatePct?: number | null;
   optionalAddOns?: OptionalAddOn[];
@@ -35,17 +41,49 @@ export interface QuoteRow extends Quote {
 }
 
 /**
- * Computes the final rupee total for a quote.
- * - Uses `q.pricingBasis ?? item.basis` so per-guest quotes scale with guest count.
- * - If `q.gst === "excluded"`, adds `q.gstRatePct` (defaults to 18% if rate is omitted) on top.
+ * Shared calculation for both live quotes and draft previews.
+ * - Uses `pricingBasis ?? itemBasis` for the base amount.
+ * - Adds each mandatory charge according to its own pricing basis ("total" vs "per_guest").
+ * - Applies GST only when `gst === "excluded"` and `gstRatePct != null` (never assumes 18%).
  */
-export const quoteTotal = (q: Quote, item: CostItem, guests: number): number => {
-  const effectiveBasis = q.pricingBasis ?? item.basis;
-  const subtotal = effectiveBasis === "per_head" ? q.amount * Math.max(1, guests) : q.amount;
+export function computeQuoteTotal(
+  amount: number,
+  itemBasis: Basis,
+  guests: number,
+  options?: {
+    pricingBasis?: Basis;
+    mandatoryCharges?: MandatoryCharge[];
+    gst?: GstStatus;
+    gstRatePct?: number | null;
+  },
+): number {
+  const safeGuests = Math.max(1, Math.round(guests));
+  const effectiveBasis = options?.pricingBasis ?? itemBasis;
+  const baseSubtotal = effectiveBasis === "per_head" ? amount * safeGuests : amount;
+
+  const mandatorySum = (options?.mandatoryCharges ?? []).reduce((sum, mc) => {
+    if (!Number.isFinite(mc.amount) || mc.amount < 0) return sum;
+    return sum + (mc.pricing === "per_guest" ? mc.amount * safeGuests : mc.amount);
+  }, 0);
+
+  const subtotal = baseSubtotal + mandatorySum;
+
   const gstMultiplier =
-    q.gst === "excluded" ? 1 + (q.gstRatePct != null && q.gstRatePct > 0 ? q.gstRatePct : 18) / 100 : 1;
+    options?.gst === "excluded" && options.gstRatePct != null && Number.isFinite(options.gstRatePct)
+      ? 1 + options.gstRatePct / 100
+      : 1;
+
   return Math.round(subtotal * gstMultiplier);
-};
+}
+
+/** Per-guest items (like catering) scale with guest count; mandatory charges & known GST are included. */
+export const quoteTotal = (q: Quote, item: CostItem, guests: number): number =>
+  computeQuoteTotal(q.amount, item.basis, guests, {
+    pricingBasis: q.pricingBasis,
+    mandatoryCharges: q.mandatoryCharges,
+    gst: q.gst,
+    gstRatePct: q.gstRatePct,
+  });
 
 export type QuoteExtra = Partial<
   Pick<
@@ -88,7 +126,6 @@ export function compareQuotes(quotes: Quote[], item: CostItem, guests: number, m
   if (rows.length > 1) {
     const min = Math.min(...rows.map((r) => r.total));
     const max = Math.max(...rows.map((r) => r.total));
-    // Highlight all tied lowest quotes, unless every single quote has the exact same price
     if (min < max) {
       for (const r of rows) {
         if (r.total === min) r.best = true;

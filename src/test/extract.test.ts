@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { handleExtract, matchesMime, resetExtractState } from "../server/extract.js";
+import { draftSchema, handleExtract, matchesMime, resetExtractState } from "../server/extract.js";
 import { normaliseAmount } from "../lib/vendors.js";
 
 const pdf = Buffer.from("%PDF-1.4 sample quotation content").toString("base64");
@@ -15,7 +15,7 @@ const draft = {
   vendor: "Grand Hall",
   categoryId: "venue",
   baseAmount: 80000,
-  mandatoryCharges: null,
+  mandatoryCharges: [{ name: "Generator", amount: 5000, pricing: "total" }],
   pricing: "total",
   gst: "excluded",
   gstRatePct: 18,
@@ -46,7 +46,7 @@ describe("matchesMime", () => {
   });
 });
 
-describe("handleExtract", () => {
+describe("handleExtract & draftSchema", () => {
   it("rejects invalid bodies, wrong types and oversized files", async () => {
     expect((await handleExtract("{", "1.1.1.1", env)).status).toBe(400);
     expect((await handleExtract(body({ mimeType: "text/html" }), "1.1.1.1", env)).status).toBe(400);
@@ -54,30 +54,55 @@ describe("handleExtract", () => {
     expect((await handleExtract(body({ data: "A".repeat(4_196_000) }), "1.1.1.1", env)).status).toBe(413);
   });
 
-  it("returns a cleaned draft keeping baseAmount separate from optionalAddOns", async () => {
-    const photoDraft = {
+  it("keeps baseAmount separate from mandatoryCharges and optionalAddOns", async () => {
+    const cateringDraft = {
       ...draft,
-      vendor: "Lens Studio",
-      categoryId: "photo",
-      baseAmount: 62000,
-      optionalAddOns: [{ name: "Pre-wedding shoot", amount: 8000 }],
+      vendor: "Spice Caterers",
+      categoryId: "catering",
+      baseAmount: 650,
+      pricing: "per_guest",
+      mandatoryCharges: [
+        { name: "Delivery & Setup", amount: 5000, pricing: "total" },
+        { name: "Live Counter Staff", amount: 40, pricing: "per_guest" },
+      ],
+      optionalAddOns: [
+        { name: "Artisanal Kulfi Bar", amount: 8000 },
+        { name: "Custom Ice Sculpture", amount: null },
+      ],
     };
-    const r = await handleExtract(body(), "2.2.2.2", env, fetchWith(photoDraft));
+    const r = await handleExtract(body(), "2.2.2.2", env, fetchWith(cateringDraft));
     expect(r.status).toBe(200);
-    const extracted = (
-      r.body as {
-        draft: {
-          vendor: string;
-          amount: number;
-          baseAmount: number;
-          optionalAddOns: { name: string; amount: number }[];
-        };
-      }
-    ).draft;
-    expect(extracted.vendor).toBe("Lens Studio");
-    expect(extracted.baseAmount).toBe(62000);
-    expect(extracted.amount).toBe(62000);
-    expect(extracted.optionalAddOns).toEqual([{ name: "Pre-wedding shoot", amount: 8000 }]);
+    const extracted = (r.body as { draft: ReturnType<typeof draftSchema.parse> }).draft;
+    expect(extracted.vendor).toBe("Spice Caterers");
+    // Base amount is NOT mixed with the ₹5,000 fixed delivery charge
+    expect(extracted.baseAmount).toBe(650);
+    expect(extracted.amount).toBe(650);
+    expect(extracted.mandatoryCharges).toEqual([
+      { name: "Delivery & Setup", amount: 5000, pricing: "total" },
+      { name: "Live Counter Staff", amount: 40, pricing: "per_guest" },
+    ]);
+    expect(extracted.optionalAddOns).toEqual([
+      { name: "Artisanal Kulfi Bar", amount: 8000 },
+      { name: "Custom Ice Sculpture", amount: null },
+    ]);
+  });
+
+  it("preserves unknown GST status and explicit 0% GST rate without inventing 18%", () => {
+    const unknownGst = draftSchema.parse({
+      ...draft,
+      gst: "unknown",
+      gstRatePct: null,
+    });
+    expect(unknownGst.gst).toBe("unknown");
+    expect(unknownGst.gstRatePct).toBeNull();
+
+    const zeroGst = draftSchema.parse({
+      ...draft,
+      gst: "excluded",
+      gstRatePct: 0,
+    });
+    expect(zeroGst.gst).toBe("excluded");
+    expect(zeroGst.gstRatePct).toBe(0);
   });
 
   it("drops a category id that is not in the plan", async () => {
@@ -85,13 +110,17 @@ describe("handleExtract", () => {
     expect((r.body as { draft: { categoryId: unknown } }).draft.categoryId).toBeNull();
   });
 
-  it("returns 502 when the AI output is invalid or the call fails", async () => {
+  it("returns 502 when the AI output is invalid or incomplete", async () => {
     expect((await handleExtract(body(), "4.4.4.4", env, fetchWith({ vendor: 5 }))).status).toBe(502);
+    expect(
+      (await handleExtract(body(), "4.4.4.6", env, fetchWith({ ...draft, mandatoryCharges: [{ amount: -100 }] })))
+        .status,
+    ).toBe(502);
     const down = vi.fn(async () => ({ ok: false, status: 503 })) as unknown as typeof fetch;
     expect((await handleExtract(body(), "4.4.4.5", env, down)).status).toBe(502);
   });
 
-  it("returns 503 without a key and 429 after 5 requests a minute (including comma-separated proxy IPs)", async () => {
+  it("returns 503 without a key and 429 after 5 requests a minute", async () => {
     expect((await handleExtract(body(), "5.5.5.5", {})).status).toBe(503);
     let last = 0;
     for (let i = 0; i < 6; i++) last = (await handleExtract("{}", "6.6.6.6, 10.0.0.1", env)).status;

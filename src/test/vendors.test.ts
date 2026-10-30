@@ -19,15 +19,65 @@ describe("vendor quotes", () => {
     expect(quoteTotal(q, catering, 150)).toBe(90000);
     expect(quoteTotal(q, catering, 200)).toBe(120000);
 
-    // Flat package quote inside a per-head category stays fixed when guest count changes
     const flatCatering = makeQuote("catering", "Flat Caterer", 90000, { pricingBasis: "fixed" })!;
     expect(quoteTotal(flatCatering, catering, 150)).toBe(90000);
     expect(quoteTotal(flatCatering, catering, 200)).toBe(90000);
   });
 
-  it("adds excluded GST into quoteTotal and projectedSpend", () => {
-    const q = makeQuote("venue", "Royal Palace", 100000, { gst: "excluded", gstRatePct: 18 })!;
-    expect(quoteTotal(q, venue, 150)).toBe(118000);
+  it("never assumes 18% when GST is excluded but rate is unknown (null) or 0%", () => {
+    // Unknown GST must not assume 18%
+    expect(
+      quoteTotal(
+        makeQuote("venue", "Vendor", 100000, {
+          gst: "excluded",
+          gstRatePct: null,
+        })!,
+        venue,
+        150,
+      ),
+    ).toBe(100000);
+
+    // Explicit 0% GST must not assume 18%
+    expect(
+      quoteTotal(
+        makeQuote("venue", "Vendor", 100000, {
+          gst: "excluded",
+          gstRatePct: 0,
+        })!,
+        venue,
+        150,
+      ),
+    ).toBe(100000);
+
+    // Different known GST rates (5%, 12%, 18%)
+    expect(
+      quoteTotal(makeQuote("venue", "Vendor", 100000, { gst: "excluded", gstRatePct: 5 })!, venue, 150),
+    ).toBe(105000);
+    expect(
+      quoteTotal(makeQuote("venue", "Vendor", 100000, { gst: "excluded", gstRatePct: 12 })!, venue, 150),
+    ).toBe(112000);
+    expect(
+      quoteTotal(makeQuote("venue", "Vendor", 100000, { gst: "excluded", gstRatePct: 18 })!, venue, 150),
+    ).toBe(118000);
+  });
+
+  it("calculates per-guest base price plus fixed/per-guest mandatory charges accurately", () => {
+    // Catering base: ₹650 per guest * 150 = ₹97,500 + Mandatory delivery ₹5,000 total = ₹1,02,500
+    const q = makeQuote("catering", "Royal Feast", 650, {
+      pricingBasis: "per_head",
+      mandatoryCharges: [{ name: "Delivery & Setup", amount: 5000, pricing: "total" }],
+    })!;
+    expect(quoteTotal(q, catering, 150)).toBe(102500);
+
+    // With additional per-guest mandatory charge (₹50/guest * 150 = ₹7,500) -> ₹1,10,000
+    const qMixed = makeQuote("catering", "Royal Feast", 650, {
+      pricingBasis: "per_head",
+      mandatoryCharges: [
+        { name: "Delivery & Setup", amount: 5000, pricing: "total" },
+        { name: "Service Staff", amount: 50, pricing: "per_guest" },
+      ],
+    })!;
+    expect(quoteTotal(qMixed, catering, 150)).toBe(110000);
   });
 
   it("preserves exact total when converting total to per-guest and back (no ₹50 rounding drift)", () => {
@@ -45,7 +95,6 @@ describe("vendor quotes", () => {
     expect(rows.find((r) => r.vendor === "B")!.diff).toBeGreaterThan(0);
     expect(rows.find((r) => r.vendor === "A")!.diff).toBeLessThan(0);
 
-    // Tied lowest quotes both get best = true when another quote is higher
     const a2 = makeQuote("venue", "A2", 50000)!;
     const tiedRows = compareQuotes([a, a2, b], venue, 150);
     expect(tiedRows.find((r) => r.vendor === "A")!.best).toBe(true);
@@ -57,11 +106,12 @@ describe("vendor quotes", () => {
     expect(compareQuotes([makeQuote("venue", "A", 50000)!], venue, 150)[0].best).toBe(false);
   });
 
-  it("swaps booked quotes into the projected spend and filters by event mode", () => {
+  it("isolates quotes between event modes in compareQuotes and projectedSpend", () => {
     const base = projectedSpend(items, [], 150);
     const weddingQuote = { ...makeQuote("venue", "A", 10000, { mode: "wedding" })!, booked: true };
     expect(projectedSpend(items, [weddingQuote], 150, "wedding")).toBeLessThan(base);
     expect(projectedSpend(items, [weddingQuote], 150, "birthday")).toBe(base);
-    expect(projectedSpend(items, [{ ...weddingQuote, booked: false }], 150, "wedding")).toBe(base);
+    expect(compareQuotes([weddingQuote], venue, 150, "birthday")).toHaveLength(0);
+    expect(compareQuotes([weddingQuote], venue, 150, "wedding")).toHaveLength(1);
   });
 });

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
+import { z } from "zod";
 import { applyBudgetCut, computeTotals, fitToBudget, itemCost } from "./lib/budget";
 import { buildPlan } from "./lib/templates";
 import type { EventMode } from "./lib/types";
@@ -6,10 +7,12 @@ import type { PlanResult } from "./server/plan";
 import { addDays, buildTimeline, isValidDate, localToday } from "./lib/timeline";
 import {
   compareQuotes,
+  computeQuoteTotal,
   makeQuote,
   normaliseAmount,
   projectedSpend,
   type GstStatus,
+  type MandatoryCharge,
   type OptionalAddOn,
   type Quote,
 } from "./lib/vendors";
@@ -20,7 +23,7 @@ const MIN_BUDGET = 10_000;
 const MAX_BUDGET = 100_000_000;
 const MIN_GUESTS = 1;
 const MAX_GUESTS = 5_000;
-const STORAGE_KEY = "event-copilot-state-v1";
+const STORAGE_KEY = "event-copilot-state-v2";
 
 const clampInt = (val: number, min: number, max: number): number => {
   if (!Number.isFinite(val)) return min;
@@ -60,6 +63,17 @@ const VIBE_PRESETS: Record<EventMode, { label: string; value: string }[]> = {
 
 const CITY_PRESETS = ["Bengaluru", "Mumbai", "Delhi NCR", "Kolkata", "Chennai", "Hyderabad", "Pune", "Jaipur"];
 
+interface DraftChargeInput {
+  name: string;
+  amount: string;
+  pricing: "total" | "per_guest";
+}
+
+interface DraftAddOnInput {
+  name: string;
+  amount: string;
+}
+
 interface Draft {
   mode: EventMode;
   itemId: string;
@@ -67,12 +81,11 @@ interface Draft {
   amount: string;
   rawAmount: number | null;
   rawPricing: "total" | "per_guest" | "unknown";
-  baseAmount: number | null;
-  mandatoryCharges: number | null;
+  mandatoryCharges: DraftChargeInput[];
   gst: GstStatus;
-  gstRatePct: number | null;
-  optionalAddOns: OptionalAddOn[];
-  overtimeRates: string[];
+  gstRatePct: string;
+  optionalAddOns: DraftAddOnInput[];
+  overtimeRates: string;
   inclusions: string;
   exclusions: string;
   paymentTerms: string;
@@ -80,24 +93,76 @@ interface Draft {
   confidence: string;
 }
 
-interface StoredState {
-  mode?: EventMode;
-  budget?: number;
-  guests?: number;
-  reserve?: number;
-  cutPct?: number;
-  city?: string;
-  vibe?: string;
-  eventDate?: string;
-  quotesByMode?: Record<EventMode, Quote[]>;
-  doneByMode?: Record<EventMode, string[]>;
-}
+// Issue #6 Fix: Full Zod validation for saved localStorage state
+const storedQuoteSchema = z.object({
+  id: z.string().min(1).max(120),
+  itemId: z.string().min(1).max(40),
+  vendor: z.string().min(1).max(60),
+  amount: z.number().positive().max(MAX_BUDGET),
+  booked: z.boolean(),
+  mode: z.enum(["wedding", "birthday", "community"]).optional(),
+  pricingBasis: z.enum(["fixed", "per_head"]).optional(),
+  baseAmount: z.number().min(0).max(MAX_BUDGET).optional(),
+  mandatoryCharges: z
+    .array(
+      z.object({
+        name: z.string().max(80),
+        amount: z.number().min(0).max(MAX_BUDGET),
+        pricing: z.enum(["total", "per_guest"]),
+      }),
+    )
+    .optional(),
+  gst: z.enum(["included", "excluded", "unknown"]).optional(),
+  gstRatePct: z.number().min(0).max(50).nullable().optional(),
+  optionalAddOns: z
+    .array(
+      z.object({
+        name: z.string().max(80),
+        amount: z.number().min(0).max(MAX_BUDGET).nullable(),
+      }),
+    )
+    .optional(),
+  overtimeRates: z.array(z.string().max(100)).optional(),
+  inclusions: z.array(z.string().max(120)).optional(),
+  exclusions: z.array(z.string().max(120)).optional(),
+  paymentTerms: z.string().max(300).optional(),
+});
+
+const storedStateSchema = z.object({
+  mode: z.enum(["wedding", "birthday", "community"]).optional(),
+  budget: z.number().int().min(MIN_BUDGET).max(MAX_BUDGET).optional(),
+  guests: z.number().int().min(MIN_GUESTS).max(MAX_GUESTS).optional(),
+  reserve: z.number().min(0).max(20).optional(),
+  cutPct: z.number().min(0).max(40).optional(),
+  city: z.string().max(60).optional(),
+  vibe: z.string().max(200).optional(),
+  eventDate: z.string().optional(),
+  quotesByMode: z
+    .object({
+      wedding: z.array(storedQuoteSchema),
+      birthday: z.array(storedQuoteSchema),
+      community: z.array(storedQuoteSchema),
+    })
+    .optional(),
+  doneByMode: z
+    .object({
+      wedding: z.array(z.string().max(60)),
+      birthday: z.array(z.string().max(60)),
+      community: z.array(z.string().max(60)),
+    })
+    .optional(),
+});
+
+type StoredState = z.infer<typeof storedStateSchema>;
 
 function loadSavedState(): StoredState | null {
   try {
     if (typeof window === "undefined" || !window.localStorage) return null;
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    return raw ? (JSON.parse(raw) as StoredState) : null;
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    const validated = storedStateSchema.safeParse(parsed);
+    return validated.success ? validated.data : null;
   } catch {
     return null;
   }
@@ -115,10 +180,23 @@ function readBase64(file: File): Promise<string> {
   });
 }
 
+// Issue #1 Fix: Never hardcode 18% when GST rate is unknown
 function formatGstBadge(gst?: GstStatus, rate?: number | null): string | null {
   if (!gst || gst === "unknown") return null;
-  const rateText = rate != null ? ` ${rate}%` : " 18%";
-  return gst === "included" ? `GST${rate != null ? ` ${rate}%` : ""} incl.` : `+ GST${rateText} extra (included in total)`;
+  if (gst === "included") {
+    return rate != null ? `GST ${rate}% incl.` : "GST incl.";
+  }
+  return rate != null ? `+ GST ${rate}% extra (incl. in total)` : "+ GST extra (rate unknown — excl. from total)";
+}
+
+function parseDraftMandatoryCharges(list: DraftChargeInput[]): MandatoryCharge[] {
+  return list
+    .map((c) => ({
+      name: c.name.trim().slice(0, 80) || "Mandatory charge",
+      amount: Number(c.amount),
+      pricing: c.pricing,
+    }))
+    .filter((c) => Number.isFinite(c.amount) && c.amount > 0 && c.amount <= MAX_BUDGET);
 }
 
 export default function App() {
@@ -149,7 +227,9 @@ export default function App() {
   const [qItem, setQItem] = useState("");
   const [qVendor, setQVendor] = useState("");
   const [qAmount, setQAmount] = useState("");
-  const [qGstExtra, setQGstExtra] = useState(false);
+  // Issue #2 Fix: 3-state manual GST selection ("unknown" default, "included", "excluded" + explicit rate)
+  const [qGstStatus, setQGstStatus] = useState<GstStatus>("unknown");
+  const [qGstRate, setQGstRate] = useState<string>("");
   const [qError, setQError] = useState("");
   const [draft, setDraft] = useState<Draft | null>(null);
   const [extracting, setExtracting] = useState(false);
@@ -158,16 +238,18 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const activeModeRef = useRef<EventMode>(mode);
-  activeModeRef.current = mode;
-  const extractSeqRef = useRef(0);
-
   const safeBudget = clampInt(budget, MIN_BUDGET, MAX_BUDGET);
   const safeGuests = clampInt(guests, MIN_GUESTS, MAX_GUESTS);
   const safeReserve = clampInt(reserve, 0, 20);
   const safeCutPct = clampInt(cutPct, 0, 40);
 
-  // Persist user work to localStorage so accidental refreshes never wipe quotes or tasks
+  // Issue #4 & #5 Fix: Track active mode and live guest count via refs for in-flight extraction checks
+  const activeModeRef = useRef<EventMode>(mode);
+  activeModeRef.current = mode;
+  const activeGuestsRef = useRef<number>(safeGuests);
+  activeGuestsRef.current = safeGuests;
+  const extractSeqRef = useRef(0);
+
   useEffect(() => {
     try {
       if (typeof window === "undefined" || !window.localStorage) return;
@@ -206,6 +288,17 @@ export default function App() {
     setDraft(null);
     setQError("");
     setMode(nextMode);
+  }
+
+  function handleGuestsChange(nextGuests: number) {
+    const nextSafe = clampInt(nextGuests, MIN_GUESTS, MAX_GUESTS);
+    if (extracting && nextSafe !== activeGuestsRef.current) {
+      extractSeqRef.current += 1;
+      setExtracting(false);
+      setDraft(null);
+      setXError("Guest count changed while reading the quotation. Please upload the file again.");
+    }
+    setGuests(nextGuests);
   }
 
   const view = useMemo(() => {
@@ -258,11 +351,20 @@ export default function App() {
   const available = view.totals.available;
 
   function addQuote() {
+    let parsedRate: number | null = null;
+    if (qGstStatus === "excluded" && qGstRate.trim() !== "") {
+      const r = Number(qGstRate);
+      if (!Number.isFinite(r) || r < 0 || r > 50) {
+        setQError("Enter a valid GST rate between 0% and 50%, or leave it blank if unknown.");
+        return;
+      }
+      parsedRate = r;
+    }
     const q = makeQuote(quoteItem.id, qVendor, Number(qAmount), {
       mode,
       pricingBasis: quoteItem.basis,
-      gst: qGstExtra ? "excluded" : "included",
-      gstRatePct: qGstExtra ? 18 : null,
+      gst: qGstStatus,
+      gstRatePct: parsedRate,
     });
     if (!q) {
       setQError("Enter a vendor name and an amount between ₹1 and ₹10,00,00,000.");
@@ -272,7 +374,8 @@ export default function App() {
     setQuotesByMode((prev) => ({ ...prev, [mode]: [...prev[mode], q] }));
     setQVendor("");
     setQAmount("");
-    setQGstExtra(false);
+    setQGstStatus("unknown");
+    setQGstRate("");
   }
 
   function setBooked(id: string) {
@@ -293,7 +396,19 @@ export default function App() {
   const activeDraft = draft && draft.mode === mode ? draft : null;
   const draftItem = activeDraft ? view.plan.find((i) => i.id === activeDraft.itemId) ?? quoteItem : null;
 
-  function upd(k: keyof Draft, v: string) {
+  function upd(
+    k:
+      | "itemId"
+      | "vendor"
+      | "amount"
+      | "gst"
+      | "gstRatePct"
+      | "overtimeRates"
+      | "inclusions"
+      | "exclusions"
+      | "paymentTerms",
+    v: string,
+  ) {
     setDraft((d) => {
       if (!d) return null;
       if (k === "itemId") {
@@ -312,16 +427,61 @@ export default function App() {
     });
   }
 
+  function updateDraftMandatory(idx: number, field: keyof DraftChargeInput, value: string) {
+    setDraft((d) => {
+      if (!d) return null;
+      const next = d.mandatoryCharges.map((item, i) => (i === idx ? { ...item, [field]: value } : item));
+      return { ...d, mandatoryCharges: next };
+    });
+  }
+
+  function addDraftMandatory() {
+    setDraft((d) =>
+      d
+        ? {
+            ...d,
+            mandatoryCharges: [...d.mandatoryCharges, { name: "", amount: "", pricing: "total" }],
+          }
+        : null,
+    );
+  }
+
+  function removeDraftMandatory(idx: number) {
+    setDraft((d) => (d ? { ...d, mandatoryCharges: d.mandatoryCharges.filter((_, i) => i !== idx) } : null));
+  }
+
+  function updateDraftAddOn(idx: number, field: keyof DraftAddOnInput, value: string) {
+    setDraft((d) => {
+      if (!d) return null;
+      const next = d.optionalAddOns.map((item, i) => (i === idx ? { ...item, [field]: value } : item));
+      return { ...d, optionalAddOns: next };
+    });
+  }
+
+  function addDraftAddOn() {
+    setDraft((d) => (d ? { ...d, optionalAddOns: [...d.optionalAddOns, { name: "", amount: "" }] } : null));
+  }
+
+  function removeDraftAddOn(idx: number) {
+    setDraft((d) => (d ? { ...d, optionalAddOns: d.optionalAddOns.filter((_, i) => i !== idx) } : null));
+  }
+
   const draftPlanned = draftItem ? itemCost(draftItem, safeGuests) : 0;
-  const draftBaseTotal =
+  const parsedDraftGstRate =
+    activeDraft && activeDraft.gst === "excluded" && activeDraft.gstRatePct.trim() !== ""
+      ? Number(activeDraft.gstRatePct)
+      : null;
+
+  // Issue #1 Fix: Use the exact same `computeQuoteTotal` function as `quoteTotal()`
+  const draftTotal =
     activeDraft && draftItem
-      ? Number(activeDraft.amount || 0) * (draftItem.basis === "per_head" ? safeGuests : 1)
+      ? computeQuoteTotal(Number(activeDraft.amount || 0), draftItem.basis, safeGuests, {
+          pricingBasis: draftItem.basis,
+          mandatoryCharges: parseDraftMandatoryCharges(activeDraft.mandatoryCharges),
+          gst: activeDraft.gst,
+          gstRatePct: parsedDraftGstRate,
+        })
       : 0;
-  const draftGstMultiplier =
-    activeDraft?.gst === "excluded"
-      ? 1 + (activeDraft.gstRatePct != null && activeDraft.gstRatePct > 0 ? activeDraft.gstRatePct : 18) / 100
-      : 1;
-  const draftTotal = Math.round(draftBaseTotal * draftGstMultiplier);
   const draftSuspicious = draftTotal > available;
 
   async function onFile(e: ChangeEvent<HTMLInputElement>) {
@@ -359,15 +519,23 @@ export default function App() {
       });
       const out = await res.json().catch(() => ({}));
 
+      // Issue #4 & #5 Fix: Verify request ID, event mode, and guest count haven't changed mid-extraction
       if (reqId !== extractSeqRef.current || activeModeRef.current !== uploadMode) {
+        return;
+      }
+      if (activeGuestsRef.current !== uploadGuests) {
+        setXError("Guest count changed while reading the quotation. Please upload the file again.");
         return;
       }
 
       if (!res.ok) throw new Error(out.error ?? "The server had a problem. Please try again.");
       const d = out.draft;
       const matchedItem = uploadPlanSnapshot.find((i) => i.id === d.categoryId) ?? uploadPlanSnapshot[0];
-      const rawAmount: number | null = d.amount ?? d.baseAmount ?? null;
+      const rawAmount: number | null = d.baseAmount ?? d.amount ?? null;
       const norm = normaliseAmount(d.pricing, rawAmount, matchedItem.basis, uploadGuests);
+
+      const rawMandatory: MandatoryCharge[] = Array.isArray(d.mandatoryCharges) ? d.mandatoryCharges : [];
+      const rawAddOns: OptionalAddOn[] = Array.isArray(d.optionalAddOns) ? d.optionalAddOns : [];
 
       setDraft({
         mode: uploadMode,
@@ -376,12 +544,18 @@ export default function App() {
         amount: norm.amount != null ? String(norm.amount) : "",
         rawAmount,
         rawPricing: d.pricing ?? "unknown",
-        baseAmount: d.baseAmount ?? rawAmount,
-        mandatoryCharges: d.mandatoryCharges ?? null,
+        mandatoryCharges: rawMandatory.map((mc) => ({
+          name: mc.name ?? "Mandatory charge",
+          amount: String(mc.amount ?? ""),
+          pricing: mc.pricing === "per_guest" ? "per_guest" : "total",
+        })),
         gst: d.gst ?? "unknown",
-        gstRatePct: d.gstRatePct ?? null,
-        optionalAddOns: Array.isArray(d.optionalAddOns) ? d.optionalAddOns : [],
-        overtimeRates: Array.isArray(d.overtimeRates) ? d.overtimeRates : [],
+        gstRatePct: d.gstRatePct != null ? String(d.gstRatePct) : "",
+        optionalAddOns: rawAddOns.map((ao) => ({
+          name: ao.name ?? "",
+          amount: ao.amount != null ? String(ao.amount) : "",
+        })),
+        overtimeRates: Array.isArray(d.overtimeRates) ? d.overtimeRates.join("\n") : "",
         inclusions: Array.isArray(d.inclusions) ? d.inclusions.join("\n") : "",
         exclusions: Array.isArray(d.exclusions) ? d.exclusions.join("\n") : "",
         paymentTerms: d.paymentTerms ?? "",
@@ -404,15 +578,21 @@ export default function App() {
 
   function confirmDraft() {
     if (!activeDraft || !draftItem) return;
-    const lines = (s: string) =>
+    const lines = (s: string, maxLen = 120, maxItems = 10) =>
       s
         .split("\n")
-        .map((x) => x.trim().slice(0, 120))
+        .map((x) => x.trim().slice(0, maxLen))
         .filter(Boolean)
-        .slice(0, 10);
+        .slice(0, maxItems);
 
-    // If user didn't manually override the normalised amount and the vendor's original pricing unit is known,
-    // preserve the vendor's exact pricing basis (total vs per_guest) so future guest count edits don't distort fixed quotes.
+    if (activeDraft.gst === "excluded" && activeDraft.gstRatePct.trim() !== "") {
+      const rateNum = Number(activeDraft.gstRatePct);
+      if (!Number.isFinite(rateNum) || rateNum < 0 || rateNum > 50) {
+        setXError("GST rate must be between 0% and 50%, or left blank if unknown.");
+        return;
+      }
+    }
+
     const expectedNorm = normaliseAmount(activeDraft.rawPricing, activeDraft.rawAmount, draftItem.basis, safeGuests);
     const amountUnchanged =
       activeDraft.rawAmount != null &&
@@ -428,21 +608,35 @@ export default function App() {
         : "fixed"
       : draftItem.basis;
 
+    const cleanedMandatory = parseDraftMandatoryCharges(activeDraft.mandatoryCharges);
+    const cleanedAddOns: OptionalAddOn[] = activeDraft.optionalAddOns
+      .map((a) => {
+        const trimmedName = a.name.trim().slice(0, 80);
+        const rawAmt = a.amount.trim();
+        const parsedAmt = rawAmt !== "" && Number.isFinite(Number(rawAmt)) && Number(rawAmt) >= 0 ? Number(rawAmt) : null;
+        return { name: trimmedName, amount: parsedAmt };
+      })
+      .filter((a) => Boolean(a.name))
+      .slice(0, 8);
+
     const q = makeQuote(activeDraft.itemId, activeDraft.vendor, finalAmount, {
       mode: activeDraft.mode,
       pricingBasis: finalBasis,
-      baseAmount: activeDraft.baseAmount ?? undefined,
-      mandatoryCharges: activeDraft.mandatoryCharges ?? undefined,
+      baseAmount: finalAmount,
+      mandatoryCharges: cleanedMandatory,
       gst: activeDraft.gst,
-      gstRatePct: activeDraft.gstRatePct,
-      optionalAddOns: activeDraft.optionalAddOns,
-      overtimeRates: activeDraft.overtimeRates,
-      inclusions: lines(activeDraft.inclusions),
-      exclusions: lines(activeDraft.exclusions),
+      gstRatePct:
+        activeDraft.gst === "excluded" && activeDraft.gstRatePct.trim() !== ""
+          ? Number(activeDraft.gstRatePct)
+          : null,
+      optionalAddOns: cleanedAddOns,
+      overtimeRates: lines(activeDraft.overtimeRates, 100, 6),
+      inclusions: lines(activeDraft.inclusions, 120, 10),
+      exclusions: lines(activeDraft.exclusions, 120, 10),
       paymentTerms: activeDraft.paymentTerms.trim().slice(0, 300),
     });
     if (!q) {
-      setXError("A vendor name and an amount above 0 are required.");
+      setXError("A vendor name and a base amount above 0 are required.");
       return;
     }
     setQuotesByMode((prev) => ({ ...prev, [activeDraft.mode]: [...prev[activeDraft.mode], q] }));
@@ -578,12 +772,12 @@ export default function App() {
                 setGuestsInput(rawStr);
                 const parsed = Number(rawStr);
                 if (rawStr !== "" && Number.isFinite(parsed)) {
-                  setGuests(parsed);
+                  handleGuestsChange(parsed);
                 }
               }}
               onBlur={() => {
                 const clamped = clampInt(Number(guestsInput), MIN_GUESTS, MAX_GUESTS);
-                setGuests(clamped);
+                handleGuestsChange(clamped);
                 setGuestsInput(String(clamped));
               }}
             />
@@ -783,37 +977,15 @@ export default function App() {
           </label>
           {extracting && <p aria-live="polite">Reading the quotation…</p>}
           {xError && <p role="alert">{xError}</p>}
+
+          {/* Issue #4 Fix: Fully editable quotation review interface */}
           {activeDraft && draftItem && (
             <div className="draft">
               <h3>Review the extracted quote</h3>
               <p className="sub">
-                AI confidence: {activeDraft.confidence}. Base package price is kept separate from optional add-ons.
-                {activeDraft.note && ` ${activeDraft.note}`}
+                AI confidence: {activeDraft.confidence}. Check and edit every field before saving. If you change the
+                category, re-check the amount.{activeDraft.note && ` ${activeDraft.note}`}
               </p>
-
-              <div className="breakdown-badges">
-                {activeDraft.baseAmount != null && (
-                  <span className="chip">Base: {inr(activeDraft.baseAmount)}</span>
-                )}
-                {activeDraft.mandatoryCharges != null && activeDraft.mandatoryCharges > 0 && (
-                  <span className="chip due_soon">Mandatory fees: +{inr(activeDraft.mandatoryCharges)}</span>
-                )}
-                {formatGstBadge(activeDraft.gst, activeDraft.gstRatePct) && (
-                  <span className={`chip ${activeDraft.gst === "excluded" ? "due_soon" : "good"}`}>
-                    {formatGstBadge(activeDraft.gst, activeDraft.gstRatePct)}
-                  </span>
-                )}
-                {activeDraft.optionalAddOns.map((addon, idx) => (
-                  <span key={idx} className="chip addon-chip">
-                    Optional: {addon.name} {addon.amount != null ? `(${inr(addon.amount)})` : ""}
-                  </span>
-                ))}
-                {activeDraft.overtimeRates.map((ot, idx) => (
-                  <span key={idx} className="chip addon-chip">
-                    Overtime: {ot}
-                  </span>
-                ))}
-              </div>
 
               <div className="grid">
                 <label>
@@ -841,16 +1013,137 @@ export default function App() {
                     onChange={(e) => upd("amount", e.target.value)}
                   />
                 </label>
+                <label>
+                  GST status
+                  <select value={activeDraft.gst} onChange={(e) => upd("gst", e.target.value as GstStatus)}>
+                    <option value="included">GST included</option>
+                    <option value="excluded">GST extra</option>
+                    <option value="unknown">GST unknown</option>
+                  </select>
+                </label>
+                {activeDraft.gst === "excluded" && (
+                  <label>
+                    GST rate (%)
+                    <input
+                      type="number"
+                      min={0}
+                      max={50}
+                      step="any"
+                      placeholder="Unknown"
+                      value={activeDraft.gstRatePct}
+                      onChange={(e) => upd("gstRatePct", e.target.value)}
+                    />
+                  </label>
+                )}
               </div>
+
+              {/* Editable Mandatory Charges List */}
+              <div className="draft-list-section">
+                <div className="draft-list-header">
+                  <span>Mandatory charges (compulsory setup, delivery, etc.)</span>
+                  <button type="button" className="preset-chip" onClick={addDraftMandatory}>
+                    + Add mandatory charge
+                  </button>
+                </div>
+                {activeDraft.mandatoryCharges.map((mc, idx) => (
+                  <div key={idx} className="draft-list-row">
+                    <input
+                      placeholder="Charge name (e.g. Setup)"
+                      maxLength={80}
+                      value={mc.name}
+                      onChange={(e) => updateDraftMandatory(idx, "name", e.target.value)}
+                    />
+                    <input
+                      type="number"
+                      min={0}
+                      max={MAX_BUDGET}
+                      step="any"
+                      placeholder="Amount (₹)"
+                      value={mc.amount}
+                      onChange={(e) => updateDraftMandatory(idx, "amount", e.target.value)}
+                    />
+                    <select
+                      value={mc.pricing}
+                      onChange={(e) =>
+                        updateDraftMandatory(idx, "pricing", e.target.value as "total" | "per_guest")
+                      }
+                    >
+                      <option value="total">Fixed total</option>
+                      <option value="per_guest">Per guest</option>
+                    </select>
+                    <button
+                      type="button"
+                      className="btn-ghost"
+                      onClick={() => removeDraftMandatory(idx)}
+                      aria-label={`Remove mandatory charge ${idx + 1}`}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              {/* Editable Optional Add-Ons List */}
+              <div className="draft-list-section">
+                <div className="draft-list-header">
+                  <span>Optional add-ons (kept separate from base quote total)</span>
+                  <button type="button" className="preset-chip" onClick={addDraftAddOn}>
+                    + Add optional add-on
+                  </button>
+                </div>
+                {activeDraft.optionalAddOns.map((ao, idx) => (
+                  <div key={idx} className="draft-list-row">
+                    <input
+                      placeholder="Add-on name (e.g. Pre-wedding shoot)"
+                      maxLength={80}
+                      value={ao.name}
+                      onChange={(e) => updateDraftAddOn(idx, "name", e.target.value)}
+                    />
+                    <input
+                      type="number"
+                      min={0}
+                      max={MAX_BUDGET}
+                      step="any"
+                      placeholder="Amount (₹, optional)"
+                      value={ao.amount}
+                      onChange={(e) => updateDraftAddOn(idx, "amount", e.target.value)}
+                    />
+                    <button
+                      type="button"
+                      className="btn-ghost"
+                      onClick={() => removeDraftAddOn(idx)}
+                      aria-label={`Remove optional add-on ${idx + 1}`}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+
               <p className="sub">
-                Total for {safeGuests} guests{activeDraft.gst === "excluded" ? " (incl. GST)" : ""}:{" "}
-                <strong>{inr(draftTotal)}</strong> (plan: {inr(draftPlanned)}).
+                Total for {safeGuests} guests: <strong>{inr(draftTotal)}</strong> (plan: {inr(draftPlanned)}).
+                {activeDraft.gst === "excluded" && parsedDraftGstRate == null && (
+                  <span className="tax-warning-inline">
+                    {" "}
+                    Excludes unknown GST — enter the GST rate (%) above to include tax in the total.
+                  </span>
+                )}
               </p>
+
               {draftSuspicious && (
                 <p role="alert">
                   This is more than your whole available budget. Check whether the amount is per guest or the total.
                 </p>
               )}
+
+              <label>
+                Overtime rates (one per line)
+                <textarea
+                  rows={2}
+                  value={activeDraft.overtimeRates}
+                  onChange={(e) => upd("overtimeRates", e.target.value)}
+                />
+              </label>
               <label>
                 Includes (one per line)
                 <textarea rows={3} value={activeDraft.inclusions} onChange={(e) => upd("inclusions", e.target.value)} />
@@ -879,6 +1172,7 @@ export default function App() {
           )}
         </div>
 
+        {/* Issue #2 Fix: Manual Quote Entry with explicit 3-choice GST status & conditional GST rate input */}
         <div className="grid">
           <label>
             Category
@@ -905,15 +1199,33 @@ export default function App() {
               onChange={(e) => setQAmount(e.target.value)}
             />
           </label>
+          <label>
+            GST status
+            <select value={qGstStatus} onChange={(e) => setQGstStatus(e.target.value as GstStatus)}>
+              <option value="unknown">GST unknown</option>
+              <option value="included">GST included</option>
+              <option value="excluded">GST extra</option>
+            </select>
+          </label>
+          {qGstStatus === "excluded" && (
+            <label>
+              GST rate (%)
+              <input
+                type="number"
+                min={0}
+                max={50}
+                step="any"
+                placeholder="e.g. 18 (leave blank if unknown)"
+                value={qGstRate}
+                onChange={(e) => setQGstRate(e.target.value)}
+              />
+            </label>
+          )}
         </div>
         <div className="row">
           <button className="btn-primary" onClick={addQuote}>
             Add quote
           </button>
-          <label className="task" style={{ fontSize: "0.84rem", marginLeft: "0.5rem" }}>
-            <input type="checkbox" checked={qGstExtra} onChange={(e) => setQGstExtra(e.target.checked)} />
-            <span>+18% GST extra</span>
-          </label>
         </div>
         {qError && <p role="alert">{qError}</p>}
 
@@ -938,6 +1250,7 @@ export default function App() {
                 <tbody>
                   {rows.map((r) => {
                     const gstBadge = formatGstBadge(r.gst, r.gstRatePct);
+                    const unknownExcludedGst = r.gst === "excluded" && r.gstRatePct == null;
                     return (
                       <tr key={r.id}>
                         <td>
@@ -945,12 +1258,23 @@ export default function App() {
                           {r.best && <span className="chip good">lowest</span>}
                           {r.booked && <span className="chip due_soon">booked</span>}
                           {gstBadge && (
-                            <span className={`chip ${r.gst === "excluded" ? "due_soon" : "good"}`}>{gstBadge}</span>
+                            <span
+                              className={`chip ${
+                                unknownExcludedGst ? "overdue" : r.gst === "excluded" ? "due_soon" : "good"
+                              }`}
+                            >
+                              {gstBadge}
+                            </span>
                           )}
-                          {r.mandatoryCharges != null && r.mandatoryCharges > 0 && (
+                          {r.mandatoryCharges && r.mandatoryCharges.length > 0 && (
                             <small>
-                              Base: {inr(r.baseAmount ?? r.amount - r.mandatoryCharges)} + Mandatory fees:{" "}
-                              {inr(r.mandatoryCharges)}
+                              Mandatory charges:{" "}
+                              {r.mandatoryCharges
+                                .map(
+                                  (mc) =>
+                                    `${mc.name} (${inr(mc.amount)}${mc.pricing === "per_guest" ? "/guest" : " total"})`,
+                                )
+                                .join(", ")}
                             </small>
                           )}
                           {r.optionalAddOns && r.optionalAddOns.length > 0 && (
@@ -958,7 +1282,7 @@ export default function App() {
                               {r.optionalAddOns.map((addon, idx) => (
                                 <span key={idx} className="chip addon-chip">
                                   Optional: {addon.name}
-                                  {addon.amount != null ? ` (${inr(addon.amount)})` : ""}
+                                  {addon.amount != null ? ` (${inr(addon.amount)})` : " (price unknown)"}
                                 </span>
                               ))}
                             </div>
@@ -970,7 +1294,10 @@ export default function App() {
                           {r.exclusions?.length ? <small>Excludes: {r.exclusions.join(", ")}</small> : null}
                           {r.paymentTerms ? <small>Payment: {r.paymentTerms}</small> : null}
                         </td>
-                        <td>{inr(r.total)}</td>
+                        <td>
+                          {inr(r.total)}
+                          {unknownExcludedGst && <small>+ unknown GST</small>}
+                        </td>
                         <td>{r.diff > 0 ? `${inr(r.diff)} over` : `${inr(-r.diff)} under`}</td>
                         <td>
                           <button onClick={() => setBooked(r.id)}>{r.booked ? "Unbook" : "Book"}</button>{" "}

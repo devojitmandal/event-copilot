@@ -25,16 +25,34 @@ export const addOnSchema = z.object({
   amount: z.number().min(0).max(100_000_000).nullable().default(null),
 });
 
+export const mandatoryChargeSchema = z.object({
+  name: clip(80).optional().default("Mandatory charge"),
+  amount: z.number().min(0).max(100_000_000),
+  pricing: z.enum(["total", "per_guest"]).optional().default("total"),
+});
+
 export const draftSchema = z
   .object({
     vendor: clip(60).nullable(),
     categoryId: clip(40).nullable(),
-    /** Mandatory base package price only (excludes optional add-ons). */
+    /** Mandatory base package price only (excludes optional add-ons and separate mandatory charges). */
     baseAmount: z.number().min(0).max(100_000_000).nullable().optional(),
-    /** Compulsory fixed fees not in baseAmount (e.g., mandatory transport/setup). */
-    mandatoryCharges: z.number().min(0).max(100_000_000).nullable().optional(),
-    /** Effective mandatory amount (baseAmount + mandatoryCharges). */
+    /** Legacy fallback field if a caller passes `amount` instead of `baseAmount`. */
     amount: z.number().min(0).max(100_000_000).nullable().optional(),
+    /** Compulsory fees with their own pricing basis ("total" vs "per_guest"). */
+    mandatoryCharges: z
+      .array(mandatoryChargeSchema)
+      .optional()
+      .default([])
+      .transform((a) =>
+        a
+          .map((x) => ({
+            name: x.name || "Mandatory charge",
+            amount: x.amount,
+            pricing: x.pricing,
+          }))
+          .slice(0, 8),
+      ),
     pricing: z.enum(["total", "per_guest", "unknown"]),
     gst: z.enum(["included", "excluded", "unknown"]).optional().default("unknown"),
     gstRatePct: z.number().min(0).max(50).nullable().optional().default(null),
@@ -55,15 +73,13 @@ export const draftSchema = z
   })
   .transform((d) => {
     const base = d.baseAmount !== undefined ? d.baseAmount : (d.amount ?? null);
-    const mandatory = d.mandatoryCharges ?? null;
-    const effectiveAmount =
-      base != null ? Math.min(100_000_000, base + (mandatory ?? 0)) : (d.amount ?? null);
     return {
       vendor: d.vendor,
       categoryId: d.categoryId,
       baseAmount: base,
-      mandatoryCharges: mandatory,
-      amount: effectiveAmount,
+      /** Kept equal to `baseAmount` (never mixed with mandatoryCharges of different bases). */
+      amount: base,
+      mandatoryCharges: d.mandatoryCharges,
       pricing: d.pricing,
       gst: d.gst,
       gstRatePct: d.gstRatePct,
@@ -100,10 +116,10 @@ If the file is not a vendor quotation, return nulls, empty arrays, gst "unknown"
 Do not guess missing values; use null or "unknown".
 
 CRITICAL PRICING RULES:
-1. "baseAmount" MUST be the mandatory core package price only. NEVER add optional add-ons (like an optional pre-wedding shoot, extra album, or optional drone) into "baseAmount".
-2. Put compulsory extra fees (like mandatory setup/transport) in "mandatoryCharges" (or null if none).
+1. "baseAmount" MUST be the mandatory core package price only. NEVER add optional add-ons (like an optional pre-wedding shoot, extra album, or optional drone) or separate mandatory charges into "baseAmount".
+2. Put compulsory extra fees (like mandatory setup, delivery, service staff, or generator charges) in "mandatoryCharges" as an array of objects: {"name": string, "amount": number, "pricing": "total" or "per_guest"}.
 3. Put optional services or upgrades in "optionalAddOns" with their name and rupee amount (or null if unpriced).
-4. Set "gst" to "included" if taxes/GST are included in the base price, "excluded" if GST is charged extra on top, or "unknown" if not stated. Set "gstRatePct" to the percentage number (e.g. 18) if explicitly stated, else null.
+4. Set "gst" to "included" if taxes/GST are included in the base price, "excluded" if GST is charged extra on top, or "unknown" if not stated. Set "gstRatePct" to the exact percentage number (e.g. 18 or 0) ONLY if explicitly stated, else null. Never guess 18.
 5. Put any hourly/per-plate/late-night overtime or extra-hour charges in "overtimeRates".
 
 Categories (id: label):
@@ -113,8 +129,8 @@ Return ONLY JSON of this shape:
 {"vendor": string or null,
  "categoryId": one id from the list above, or null,
  "baseAmount": number in rupees (mandatory base package only, digits only) or null,
- "mandatoryCharges": number in rupees (compulsory extra fees only) or null,
  "pricing": "total" or "per_guest" or "unknown",
+ "mandatoryCharges": [{"name": string, "amount": number, "pricing": "total" or "per_guest"}],
  "gst": "included" or "excluded" or "unknown",
  "gstRatePct": number or null,
  "optionalAddOns": [{"name": string, "amount": number or null}],
@@ -178,7 +194,6 @@ export async function handleExtract(
   if (Buffer.byteLength(rawBody) > MAX_EXTRACT_BODY)
     return { status: 413, body: { error: "File too large. Keep it under 3 MB." } };
 
-  // Normalize proxy IP lists and prune stale rate-limit entries to prevent memory leaks
   const clientIp = (ip.split(",")[0] ?? ip).trim() || "unknown";
   if (hits.size > 250) {
     for (const [k, times] of hits.entries()) {
