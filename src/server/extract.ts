@@ -121,6 +121,8 @@ CRITICAL PRICING RULES:
 3. Put optional services or upgrades in "optionalAddOns" with their name and rupee amount (or null if unpriced).
 4. Set "gst" to "included" if taxes/GST are included in the base price, "excluded" if GST is charged extra on top, or "unknown" if not stated. Set "gstRatePct" to the exact percentage number (e.g. 18 or 0) ONLY if explicitly stated, else null. Never guess 18.
 5. Put any hourly/per-plate/late-night overtime or extra-hour charges in "overtimeRates".
+6. "baseAmount" and "pricing" must describe the same thing. Use "per_guest" only when baseAmount is the rate for ONE person or plate (for example 650 per plate). If the document shows both a rate and a line total, use the rate with "per_guest". Use "total" only when baseAmount is a total or package price for all guests. Never put a line total under "per_guest".
+7. Never list GST or any other tax under "mandatoryCharges". Taxes belong only in "gst" and "gstRatePct".
 
 Categories (id: label):
 ${cats}
